@@ -1,0 +1,21 @@
+{
+    "task": {
+        "path": "/__modal/volumes/vo-RvMGBCFd2yaZZR6HWopTZK/projects/kh77h5tes2y6j4ah86bm0k9hd1892x8r"
+    },
+    "trial_name": "kh77h5tes2y6j4ah86bm0k9hd1892x8r__rbvertF",
+    "trials_dir": "jobs/2026-09-03__09-37-17",
+    "agent": {
+        "name": "terminus-2",
+        "model_name": "gemini/gemini-3.1-flash-lite",
+        "kwargs": {
+            "parser_name": "xml"
+        }
+    },
+    "environment": {
+        "type": "docker",
+        "extra_docker_compose": [
+            "/work/pipeline/overlay-oracle.yaml"
+        ]
+    },
+    "job_id": "6a692fc8-c065-471d-bd92-c790b1961a9d"
+}

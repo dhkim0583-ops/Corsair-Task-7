@@ -1,0 +1,934 @@
+diff --git a/src/_pytest/config/__init__.py b/src/_pytest/config/__init__.py
+index f7c4de5..ba4e50e 100644
+--- a/src/_pytest/config/__init__.py
++++ b/src/_pytest/config/__init__.py
+@@ -295,6 +295,7 @@ default_plugins = (
+     "reports",
+     "faulthandler",
+     "subtests",
++    "explain_deselections",
+ )
+ 
+ builtin_plugins = {
+diff --git a/src/_pytest/explain_deselections.py b/src/_pytest/explain_deselections.py
+new file mode 100644
+index 0000000..6e8401c
+--- /dev/null
++++ b/src/_pytest/explain_deselections.py
+@@ -0,0 +1,916 @@
++"""Explain pytest deselections grouped by selector."""
++
++from __future__ import annotations
++
++import csv as _csv
++import io
++import json
++import os
++import re
++from statistics import mean
++from statistics import median
++from typing import TYPE_CHECKING
++
++from _pytest.config import Config
++from _pytest.config import ExitCode
++from _pytest.config import hookimpl
++from _pytest.config import UsageError
++from _pytest.config.argparsing import Parser
++from _pytest.stash import StashKey
++
++
++if TYPE_CHECKING:
++    from _pytest.nodes import Item
++    from _pytest.terminal import TerminalReporter
++
++
++SCHEMA_VERSION = 1
++
++result_key: StashKey = StashKey()
++
++
++class Reason:
++    __slots__ = ("reason", "nodeids")
++
++    def __init__(self, reason: str) -> None:
++        self.reason = reason
++        self.nodeids: list[str] = []
++
++
++def _bool_ini(config: Config, name: str) -> bool:
++    val = config.getini(name)
++    if isinstance(val, bool):
++        return val
++    if isinstance(val, str):
++        return val.strip().lower() in ("1", "true", "yes", "on")
++    return bool(val)
++
++
++def pytest_addoption(parser: Parser) -> None:
++    group = parser.getgroup("explain-deselections", "Explain deselections")
++    group.addoption(
++        "--explain-deselections",
++        action="store_true",
++        default=False,
++        dest="explain_deselections",
++        help="Group deselected tests by selector and report counts.",
++    )
++    group.addoption(
++        "--explain-deselections-verbose",
++        action="store_true",
++        default=False,
++        dest="explain_deselections_verbose",
++        help="List node IDs under each reason.",
++    )
++    group.addoption(
++        "--explain-deselections-max-nodeids",
++        action="store",
++        default=None,
++        dest="explain_deselections_max_nodeids",
++        help="Cap node IDs per reason (default 0).",
++    )
++    group.addoption(
++        "--explain-deselections-nodeids-order",
++        action="store",
++        default=None,
++        dest="explain_deselections_nodeids_order",
++        help="Order node IDs: encountered|sorted.",
++    )
++    group.addoption(
++        "--explain-deselections-sort-by",
++        action="store",
++        default="reason",
++        dest="explain_deselections_sort_by",
++        help="Order output: reason|count|delta.",
++    )
++    group.addoption(
++        "--explain-deselections-show-total",
++        action="store_true",
++        default=False,
++        dest="explain_deselections_show_total",
++    )
++    group.addoption(
++        "--explain-deselections-show-stats",
++        action="store_true",
++        default=False,
++        dest="explain_deselections_show_stats",
++    )
++    group.addoption(
++        "--explain-deselections-reason-filter",
++        action="store",
++        default=None,
++        dest="explain_deselections_reason_filter",
++    )
++    group.addoption(
++        "--explain-deselections-warn-if-exceeds",
++        action="store",
++        default=None,
++        dest="explain_deselections_warn_if_exceeds",
++    )
++    group.addoption(
++        "--explain-deselections-fail-if-exceeds",
++        action="store",
++        default=None,
++        dest="explain_deselections_fail_if_exceeds",
++    )
++    group.addoption(
++        "--explain-deselections-min-count",
++        action="store",
++        default=None,
++        dest="explain_deselections_min_count",
++    )
++    group.addoption(
++        "--explain-deselections-reasons-cap",
++        action="store",
++        default=None,
++        dest="explain_deselections_reasons_cap",
++    )
++    group.addoption(
++        "--explain-deselections-min-delta",
++        action="store",
++        default=None,
++        dest="explain_deselections_min_delta",
++    )
++    group.addoption(
++        "--explain-deselections-output",
++        action="append",
++        default=None,
++        dest="explain_deselections_output",
++    )
++    group.addoption(
++        "--explain-deselections-format",
++        action="store",
++        default=None,
++        dest="explain_deselections_format",
++    )
++    group.addoption(
++        "--explain-deselections-json-pretty",
++        action="store_true",
++        default=False,
++        dest="explain_deselections_json_pretty",
++    )
++    group.addoption(
++        "--explain-deselections-json-no-nodeids",
++        action="store_true",
++        default=False,
++        dest="explain_deselections_json_no_nodeids",
++    )
++    group.addoption(
++        "--explain-deselections-csv-with-delta",
++        action="store_true",
++        default=False,
++        dest="explain_deselections_csv_with_delta",
++    )
++    group.addoption(
++        "--explain-deselections-junit",
++        action="store",
++        default=None,
++        dest="explain_deselections_junit",
++    )
++    group.addoption(
++        "--explain-deselections-baseline",
++        action="store",
++        default=None,
++        dest="explain_deselections_baseline",
++    )
++    group.addoption(
++        "--explain-deselections-fail-on-new",
++        action="store_true",
++        default=False,
++        dest="explain_deselections_fail_on_new",
++    )
++    group.addoption(
++        "--explain-deselections-update-baseline",
++        action="store_true",
++        default=False,
++        dest="explain_deselections_update_baseline",
++    )
++
++    parser.addini("explain_deselections", "Enable explain deselections", type="bool", default=False)
++    parser.addini("explain_deselections_min_count", "Min count", default=None)
++    parser.addini("explain_deselections_format", "Default format", default=None)
++    parser.addini("explain_deselections_fail_if_exceeds", "Fail if exceeds", default=None)
++    parser.addini("explain_deselections_max_nodeids", "Max nodeids", default=None)
++    parser.addini("explain_deselections_nodeids_order", "Nodeids order", default=None)
++    parser.addini("explain_deselections_junit", "Junit mode", default=None)
++
++
++class Settings:
++    def __init__(self, config: Config) -> None:
++        opt = config.option
++        self.enabled = bool(opt.explain_deselections) or _bool_ini(config, "explain_deselections")
++        self.verbose = bool(opt.explain_deselections_verbose)
++
++        # max_nodeids
++        raw = opt.explain_deselections_max_nodeids
++        if raw is None:
++            raw = config.getini("explain_deselections_max_nodeids")
++        self.max_nodeids = _int_opt(raw, 0, "--explain-deselections-max-nodeids", minimum=0)
++
++        # nodeids order
++        order = opt.explain_deselections_nodeids_order
++        if order is None:
++            order = config.getini("explain_deselections_nodeids_order")
++        if order in (None, ""):
++            order = "encountered"
++        if order not in ("encountered", "sorted"):
++            raise UsageError("choose from encountered, sorted")
++        self.nodeids_order = order
++
++        self.sort_by = opt.explain_deselections_sort_by or "reason"
++        if self.sort_by not in ("reason", "count", "delta"):
++            raise UsageError("choose from reason, count, delta")
++
++        self.show_total = bool(opt.explain_deselections_show_total)
++        self.show_stats = bool(opt.explain_deselections_show_stats)
++
++        rf = opt.explain_deselections_reason_filter
++        self.reason_filter = None
++        if rf is not None:
++            try:
++                self.reason_filter = re.compile(rf)
++            except re.error:
++                raise UsageError("invalid regex") from None
++
++        self.warn_if_exceeds = _opt_or_ini_int(
++            opt.explain_deselections_warn_if_exceeds, None,
++            "--explain-deselections-warn-if-exceeds", minimum=0,
++        )
++        fie = opt.explain_deselections_fail_if_exceeds
++        if fie is None:
++            fie = config.getini("explain_deselections_fail_if_exceeds")
++        self.fail_if_exceeds = _opt_or_ini_int(
++            fie, None, "--explain-deselections-fail-if-exceeds", minimum=0,
++        )
++
++        mc = opt.explain_deselections_min_count
++        if mc is None:
++            mc = config.getini("explain_deselections_min_count")
++        self.min_count = _opt_or_ini_int(
++            mc, None, "--explain-deselections-min-count", minimum=1,
++        )
++
++        self.reasons_cap = _opt_or_ini_int(
++            opt.explain_deselections_reasons_cap, None,
++            "--explain-deselections-reasons-cap", minimum=0,
++        )
++
++        self.baseline = opt.explain_deselections_baseline
++
++        md = opt.explain_deselections_min_delta
++        self.min_delta = _opt_or_ini_int(
++            md, None, "--explain-deselections-min-delta", minimum=0,
++        )
++        if self.min_delta is not None and not self.baseline:
++            raise UsageError("requires --explain-deselections-baseline")
++
++        # format
++        fmt = opt.explain_deselections_format
++        from_ini = False
++        if fmt is None:
++            fmt = config.getini("explain_deselections_format")
++            from_ini = fmt not in (None, "")
++        if fmt in (None, ""):
++            fmt = "text"
++        if fmt not in ("text", "json", "csv"):
++            raise UsageError("choose from text, json, csv")
++        self.default_format = fmt
++        self._format_from_ini = from_ini
++
++        self.json_pretty = bool(opt.explain_deselections_json_pretty)
++        self.json_no_nodeids = bool(opt.explain_deselections_json_no_nodeids)
++        self.csv_with_delta = bool(opt.explain_deselections_csv_with_delta)
++
++        self.outputs = list(opt.explain_deselections_output or [])
++
++        # default format needs path for json/csv
++        if self.default_format in ("json", "csv"):
++            has_stdout_only = False
++            if not self.outputs:
++                raise UsageError("requires --explain-deselections-output")
++
++        junit = opt.explain_deselections_junit
++        if junit is None:
++            junit = config.getini("explain_deselections_junit")
++        if junit in (None, ""):
++            junit = None
++        if junit is not None:
++            if junit not in ("none", "properties", "system-out"):
++                raise UsageError("choose from none, properties, system-out")
++            if not config.option.xmlpath:
++                raise UsageError("requires --junitxml")
++        self.junit = junit
++
++        self.fail_on_new = bool(opt.explain_deselections_fail_on_new)
++        self.update_baseline = bool(opt.explain_deselections_update_baseline)
++        if self.fail_on_new and not self.baseline:
++            raise UsageError("requires --explain-deselections-baseline")
++        if self.update_baseline and not self.baseline:
++            raise UsageError("requires --explain-deselections-baseline")
++
++
++def _int_opt(raw, default, name, minimum):
++    if raw in (None, ""):
++        return default
++    try:
++        val = int(raw)
++    except (TypeError, ValueError):
++        raise UsageError(f"{name}: invalid int value") from None
++    if minimum is not None and val < minimum:
++        raise UsageError(f"must be >= {minimum}")
++    return val
++
++
++def _opt_or_ini_int(raw, default, name, minimum):
++    return _int_opt(raw, default, name, minimum=minimum)
++
++
++settings_key: StashKey = StashKey()
++
++
++@hookimpl(trylast=True)
++def pytest_configure(config: Config) -> None:
++    settings = Settings(config)
++    # Eagerly load/validate baseline so errors surface as usage errors.
++    settings.baseline_data = _load_baseline_data(
++        settings, updating=settings.update_baseline
++    )
++    config.stash[settings_key] = settings
++
++
++def _build_selectors(config: Config):
++    """Return list of (reason, predicate) in precedence order.
++
++    predicate(item) -> True if this selector deselects the item.
++    """
++    from _pytest.mark import KeywordMatcher
++    from _pytest.mark import MarkMatcher
++    from _pytest.mark.expression import Expression
++
++    selectors = []
++
++    # --deselect entries in CLI order (highest precedence)
++    deselect = config.getoption("deselect") or []
++    for prefix in deselect:
++        def make_pred(prefix):
++            return lambda item: item.nodeid.startswith(prefix)
++        selectors.append((f"--deselect {prefix}", make_pred(prefix)))
++
++    # -k
++    keywordexpr = (config.option.keyword or "").lstrip()
++    if keywordexpr:
++        try:
++            kexpr = Expression.compile(keywordexpr)
++        except SyntaxError:
++            kexpr = None
++        if kexpr is not None:
++            def kpred(item, kexpr=kexpr):
++                return not kexpr.evaluate(KeywordMatcher.from_item(item))
++            selectors.append((f"-k {keywordexpr}", kpred))
++
++    # -m
++    matchexpr = config.option.markexpr or ""
++    if matchexpr:
++        try:
++            mexpr = Expression.compile(matchexpr)
++        except SyntaxError:
++            mexpr = None
++        if mexpr is not None:
++            def mpred(item, mexpr=mexpr):
++                return not mexpr.evaluate(MarkMatcher.from_markers(item.iter_markers()))
++            selectors.append((f"-m {matchexpr}", mpred))
++
++    return selectors
++
++
++@hookimpl(wrapper=True)
++def pytest_collection_modifyitems(items: list[Item], config: Config):
++    settings = config.stash.get(settings_key, None)
++    if settings is None or not settings.enabled:
++        result = yield
++        return result
++
++    original = list(items)
++    result = yield
++
++    remaining_ids = {item.nodeid for item in items}
++    deselected_items = [it for it in original if it.nodeid not in remaining_ids]
++
++    selectors = _build_selectors(config)
++
++    reasons: dict[str, Reason] = {}
++    total = 0
++    for item in deselected_items:
++        for reason_str, pred in selectors:
++            try:
++                matched = pred(item)
++            except Exception:
++                matched = False
++            if matched:
++                r = reasons.get(reason_str)
++                if r is None:
++                    r = Reason(reason_str)
++                    reasons[reason_str] = r
++                r.nodeids.append(item.nodeid)
++                total += 1
++                break
++
++    config.stash[result_key] = {
++        "reasons": reasons,
++        "total": total,
++    }
++    return result
++
++
++def _load_baseline_data(settings, updating=False):
++    if not settings.baseline:
++        return None
++    path = settings.baseline
++    if not os.path.exists(path):
++        if updating:
++            return {"total_deselected": 0, "reasons": {}}
++        raise UsageError("file not found")
++    try:
++        with open(path, encoding="utf-8") as f:
++            data = json.load(f)
++    except (ValueError, json.JSONDecodeError):
++        raise UsageError("invalid JSON") from None
++    counts = {}
++    for r in data.get("reasons", []):
++        counts[r.get("reason")] = r.get("count", 0)
++    return {
++        "total_deselected": data.get("total_deselected", 0),
++        "reasons": counts,
++    }
++
++
++def _sort_key(entry, sort_by):
++    reason = entry["reason"]
++    if sort_by == "reason":
++        return (reason,)
++    if sort_by == "count":
++        return (-entry["count"], reason)
++    if sort_by == "delta":
++        delta = entry["delta"] if entry["delta"] is not None else entry["count"]
++        return (-delta, reason)
++    return (reason,)
++
++
++def _order_nodeids(nodeids, settings):
++    if settings.nodeids_order == "sorted":
++        return sorted(nodeids)
++    return list(nodeids)
++
++
++def _compute_entries(config, settings, baseline):
++    result = config.stash.get(result_key, None)
++    if result is None:
++        result = {"reasons": {}, "total": 0}
++    reasons = result["reasons"]
++
++    baseline_reasons = baseline["reasons"] if baseline else None
++
++    entries = []
++    seen = set()
++    for reason_str, r in reasons.items():
++        count = len(r.nodeids)
++        seen.add(reason_str)
++        if baseline_reasons is not None:
++            bc = baseline_reasons.get(reason_str)
++            if bc is None:
++                delta = count
++                bcount = None
++            else:
++                bcount = bc
++                delta = count - bc
++        else:
++            bcount = None
++            delta = None
++        entries.append({
++            "reason": reason_str,
++            "count": count,
++            "nodeids": r.nodeids,
++            "baseline_count": bcount,
++            "delta": delta,
++        })
++
++    # reasons that vanished (present in baseline, absent now) are not shown.
++
++    return entries, result["total"]
++
++
++def _filtered_entries(entries, settings):
++    out = []
++    for e in entries:
++        if settings.reason_filter is not None:
++            if not settings.reason_filter.search(e["reason"]):
++                continue
++        if settings.min_count is not None and e["count"] < settings.min_count:
++            continue
++        if settings.min_delta is not None:
++            d = e["delta"] if e["delta"] is not None else e["count"]
++            if d < settings.min_delta:
++                continue
++        out.append(e)
++    out.sort(key=lambda e: _sort_key(e, settings.sort_by))
++    if settings.reasons_cap:
++        out = out[: settings.reasons_cap]
++    return out
++
++
++def _delta_suffix(entry, has_baseline):
++    if not has_baseline:
++        return ""
++    if entry["baseline_count"] is None:
++        return " (new)"
++    delta = entry["delta"]
++    if delta > 0:
++        return f" (+{delta})"
++    if delta < 0:
++        return f" ({delta})"
++    return " (+0)"
++
++
++def _text_lines(entries, settings, has_baseline):
++    lines = []
++    for e in entries:
++        suffix = _delta_suffix(e, has_baseline)
++        lines.append(f"deselected by {e['reason']}: {e['count']}{suffix}")
++    return lines
++
++
++def _report_text(entries, settings, has_baseline, total):
++    return "\n".join(_text_lines(entries, settings, False))
++
++
++def _nodeids_for_report(e, settings):
++    if settings.max_nodeids <= 0:
++        return [], 0
++    ordered = _order_nodeids(e["nodeids"], settings)
++    shown = ordered[: settings.max_nodeids]
++    more = len(ordered) - len(shown)
++    return shown, more
++
++
++def _report_json(entries, settings, has_baseline, total, baseline):
++    reasons_out = []
++    for e in entries:
++        obj = {"reason": e["reason"], "count": e["count"]}
++        if not settings.json_no_nodeids:
++            shown, more = _nodeids_for_report(e, settings)
++            obj["nodeids"] = shown
++        if has_baseline:
++            obj["baseline_count"] = e["baseline_count"] if e["baseline_count"] is not None else 0
++            obj["delta"] = e["delta"] if e["delta"] is not None else e["count"]
++        reasons_out.append(obj)
++    data = {
++        "schema_version": SCHEMA_VERSION,
++        "total_deselected": total,
++        "reasons": reasons_out,
++    }
++    if has_baseline:
++        data["baseline_total_deselected"] = baseline["total_deselected"]
++        data["total_delta"] = total - baseline["total_deselected"]
++    if settings.json_pretty:
++        return json.dumps(data, indent=2)
++    return json.dumps(data)
++
++
++def _report_csv(entries, settings, has_baseline, total):
++    buf = io.StringIO()
++    writer = _csv.writer(buf, lineterminator="\n")
++    if settings.csv_with_delta:
++        writer.writerow(["reason", "count", "baseline_count", "delta"])
++        for e in entries:
++            bc = e["baseline_count"] if e["baseline_count"] is not None else 0
++            d = e["delta"] if e["delta"] is not None else e["count"]
++            writer.writerow([e["reason"], e["count"], bc, d])
++    else:
++        writer.writerow(["reason", "count"])
++        for e in entries:
++            writer.writerow([e["reason"], e["count"]])
++    return buf.getvalue()
++
++
++def _signed(n):
++    if n >= 0:
++        return f"+{n}"
++    return str(n)
++
++
++def _report_md(entries, settings, has_baseline, total):
++    lines = ["# Deselection Report", ""]
++    lines.append(f"**Total deselected:** {total}")
++    lines.append("")
++    if not entries:
++        lines.append("No deselections recorded.")
++        return "\n".join(lines) + "\n"
++    if has_baseline:
++        lines.append("| Reason | Count | Baseline | Delta |")
++        lines.append("| --- | --- | --- | --- |")
++        for e in entries:
++            bc = e["baseline_count"] if e["baseline_count"] is not None else 0
++            d = e["delta"] if e["delta"] is not None else e["count"]
++            lines.append(f"| {e['reason']} | {e['count']} | {bc} | {_signed(d)} |")
++    else:
++        lines.append("| Reason | Count |")
++        lines.append("| --- | --- |")
++        for e in entries:
++            lines.append(f"| {e['reason']} | {e['count']} |")
++    if settings.verbose and settings.max_nodeids > 0:
++        lines.append("")
++        lines.append("## Node IDs")
++        for e in entries:
++            shown, more = _nodeids_for_report(e, settings)
++            lines.append(f"### {e['reason']}")
++            for nid in shown:
++                lines.append(f"- {nid}")
++            if more > 0:
++                lines.append(f"- (+{more} more)")
++    return "\n".join(lines) + "\n"
++
++
++def _report_html(entries, settings, has_baseline, total):
++    parts = ["<!DOCTYPE html>", "<html>", "<body>", "<h1>Deselection Report</h1>"]
++    parts.append(f"<p><strong>Total deselected:</strong> {total}</p>")
++    if not entries:
++        parts.append("<p>No deselections recorded.</p>")
++        parts.append("</body></html>")
++        return "\n".join(parts) + "\n"
++    parts.append("<table>")
++    if has_baseline:
++        parts.append("<tr><th>Reason</th><th>Count</th><th>Baseline</th><th>Delta</th></tr>")
++        for e in entries:
++            bc = e["baseline_count"] if e["baseline_count"] is not None else 0
++            d = e["delta"] if e["delta"] is not None else e["count"]
++            parts.append(f"<tr><td>{e['reason']}</td><td>{e['count']}</td><td>{bc}</td><td>{_signed(d)}</td></tr>")
++    else:
++        parts.append("<tr><th>Reason</th><th>Count</th></tr>")
++        for e in entries:
++            parts.append(f"<tr><td>{e['reason']}</td><td>{e['count']}</td></tr>")
++    parts.append("</table>")
++    if settings.verbose and settings.max_nodeids > 0:
++        for e in entries:
++            shown, more = _nodeids_for_report(e, settings)
++            parts.append(f"<h3>{e['reason']}</h3>")
++            parts.append("<ul>")
++            for nid in shown:
++                parts.append(f"<li>{nid}</li>")
++            if more > 0:
++                parts.append(f"<li>(+{more} more)</li>")
++            parts.append("</ul>")
++    parts.append("</body></html>")
++    return "\n".join(parts) + "\n"
++
++
++def _generate_report(fmt, entries, settings, has_baseline, total, baseline):
++    if fmt == "text":
++        return _report_text(entries, settings, has_baseline, total)
++    if fmt == "json":
++        return _report_json(entries, settings, has_baseline, total, baseline)
++    if fmt == "csv":
++        return _report_csv(entries, settings, has_baseline, total)
++    if fmt in ("md", "markdown"):
++        return _report_md(entries, settings, has_baseline, total)
++    if fmt in ("html", "htm"):
++        return _report_html(entries, settings, has_baseline, total)
++    return _report_text(entries, settings, has_baseline, total)
++
++
++def _resolve_output_format(spec, default_format):
++    path = spec
++    fmt = None
++    if ":" in spec:
++        head, _, tail = spec.rpartition(":")
++        if tail in ("text", "json", "csv", "md", "markdown", "html", "htm"):
++            path = head
++            fmt = tail
++    if fmt is None:
++        ext = os.path.splitext(path)[1].lower().lstrip(".")
++        if ext in ("text", "txt"):
++            fmt = "text"
++        elif ext in ("json",):
++            fmt = "json"
++        elif ext in ("csv",):
++            fmt = "csv"
++        elif ext in ("md", "markdown"):
++            fmt = "md"
++        elif ext in ("html", "htm"):
++            fmt = "html"
++    if fmt is None:
++        fmt = default_format
++    return path, fmt
++
++
++def _write_outputs(config, settings, entries, has_baseline, total, baseline):
++    for spec in settings.outputs:
++        if spec == "-":
++            content = _generate_report("text", entries, settings, has_baseline, total, baseline)
++            print(content)
++            continue
++        path, fmt = _resolve_output_format(spec, settings.default_format)
++        content = _generate_report(fmt, entries, settings, has_baseline, total, baseline)
++        parent = os.path.dirname(os.path.abspath(path))
++        if parent:
++            os.makedirs(parent, exist_ok=True)
++        with open(path, "w", encoding="utf-8") as f:
++            f.write(content)
++
++
++def _stats_lines(all_entries, settings, has_baseline, total, baseline):
++    lines = ["Deselection statistics:"]
++    counts = [e["count"] for e in all_entries]
++    distinct = len(all_entries)
++    lines.append(f"total deselected: {total}")
++    lines.append(f"distinct reasons: {distinct}")
++    if counts:
++        lines.append(f"max per reason: {max(counts)}")
++        lines.append(f"min per reason: {min(counts)}")
++        lines.append(f"mean per reason: {mean(counts):.1f}")
++        lines.append(f"median per reason: {median(counts):.1f}")
++    if has_baseline:
++        lines.append(f"total delta: {total - baseline['total_deselected']}")
++        new_r = imp = wor = unch = 0
++        for e in all_entries:
++            if e["baseline_count"] is None:
++                new_r += 1
++            else:
++                d = e["delta"]
++                if d < 0:
++                    imp += 1
++                elif d > 0:
++                    wor += 1
++                else:
++                    unch += 1
++        lines.append(f"new reasons: {new_r}")
++        lines.append(f"improved reasons: {imp}")
++        lines.append(f"worsened reasons: {wor}")
++        lines.append(f"unchanged reasons: {unch}")
++    return lines
++
++
++_SANITIZE_OK = set(
++    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-"
++)
++
++
++def _sanitize(reason):
++    return "".join(c for c in reason if c in _SANITIZE_OK)
++
++
++@hookimpl(trylast=True)
++def pytest_collection_finish(session) -> None:
++    config = session.config
++    settings = config.stash.get(settings_key, None)
++    if settings is None or not settings.enabled:
++        return
++    if settings.junit not in ("properties",):
++        return
++    from _pytest.junitxml import xml_key
++    xml = config.stash.get(xml_key, None)
++    if xml is None:
++        return
++    result = config.stash.get(result_key, None)
++    if result is None:
++        result = {"reasons": {}, "total": 0}
++    xml.add_global_property("pytest.deselections.total", str(result["total"]))
++    for reason_str, r in result["reasons"].items():
++        count = len(r.nodeids)
++        if settings.min_count is not None and count < settings.min_count:
++            continue
++        suffix = _sanitize(reason_str)
++        xml.add_global_property(f"pytest.deselections.{suffix}", str(count))
++
++
++def _prepare(config):
++    settings = config.stash.get(settings_key, None)
++    if settings is None or not settings.enabled:
++        return None
++    baseline = getattr(settings, "baseline_data", None)
++    if baseline is None and settings.baseline:
++        baseline = _load_baseline_data(settings, updating=settings.update_baseline)
++    has_baseline = baseline is not None
++    all_entries, total = _compute_entries(config, settings, baseline)
++    view = _filtered_entries(all_entries, settings)
++    return {
++        "settings": settings,
++        "baseline": baseline,
++        "has_baseline": has_baseline,
++        "all_entries": all_entries,
++        "view": view,
++        "total": total,
++    }
++
++
++def _new_reasons(prep):
++    if not prep["has_baseline"]:
++        return []
++    base = prep["baseline"]["reasons"]
++    return [e["reason"] for e in prep["all_entries"] if e["reason"] not in base]
++
++
++@hookimpl(trylast=True)
++def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
++    prep = _prepare(config)
++    if prep is None:
++        return
++    settings = prep["settings"]
++    tw = terminalreporter
++    view = prep["view"]
++    total = prep["total"]
++    has_baseline = prep["has_baseline"]
++
++    for e in view:
++        suffix = _delta_suffix(e, has_baseline)
++        tw.write_line(f"deselected by {e['reason']}: {e['count']}{suffix}")
++        if settings.verbose and settings.max_nodeids > 0:
++            shown, more = _nodeids_for_report(e, settings)
++            for nid in shown:
++                tw.write_line(f"  {nid}")
++            if more > 0:
++                tw.write_line(f"  (+{more} more)")
++
++    if settings.show_total:
++        tw.write_line(f"Total deselected: {total}")
++
++    if settings.show_stats:
++        for line in _stats_lines(prep["view"], settings, has_baseline, total, prep["baseline"]):
++            tw.write_line(line)
++
++    if settings.warn_if_exceeds is not None and total > settings.warn_if_exceeds:
++        tw.write_line(
++            f"DESELECTION WARNING: {total} tests deselected "
++            f"(warning threshold: {settings.warn_if_exceeds})"
++        )
++
++    if settings.fail_if_exceeds is not None and total > settings.fail_if_exceeds:
++        tw.write_line(
++            f"DESELECTION THRESHOLD EXCEEDED: {total} tests deselected "
++            f"(threshold: {settings.fail_if_exceeds})"
++        )
++
++    if settings.fail_on_new:
++        new = _new_reasons(prep)
++        if new:
++            tw.write_line("NEW DESELECTION REASONS: " + ", ".join(new))
++
++    _write_outputs(config, settings, view, has_baseline, total, prep["baseline"])
++
++
++@hookimpl(trylast=True)
++def pytest_sessionfinish(session, exitstatus) -> None:
++    config = session.config
++    prep = _prepare(config)
++    if prep is None:
++        return
++    settings = prep["settings"]
++    total = prep["total"]
++
++    fail = False
++    if settings.fail_if_exceeds is not None and total > settings.fail_if_exceeds:
++        fail = True
++    if settings.fail_on_new and _new_reasons(prep):
++        fail = True
++    if fail and exitstatus == 0:
++        session.exitstatus = ExitCode.TESTS_FAILED
++
++    if settings.update_baseline:
++        _update_baseline_file(config, settings, prep)
++
++    if settings.junit == "system-out":
++        _inject_system_out(config, settings, prep)
++
++
++def _update_baseline_file(config, settings, prep):
++    reasons_out = []
++    for e in prep["all_entries"]:
++        reasons_out.append({"reason": e["reason"], "count": e["count"], "nodeids": []})
++    data = {
++        "schema_version": SCHEMA_VERSION,
++        "total_deselected": prep["total"],
++        "reasons": reasons_out,
++    }
++    with open(settings.baseline, "w", encoding="utf-8") as f:
++        json.dump(data, f)
++
++
++def _inject_system_out(config, settings, prep):
++    import xml.etree.ElementTree as ET
++    from _pytest.junitxml import xml_key
++    xml = config.stash.get(xml_key, None)
++    if xml is None:
++        return
++    logfile = xml.logfile
++    if not os.path.exists(logfile):
++        return
++    lines = _text_lines(prep["view"], settings, prep["has_baseline"])
++    content = "\n".join(lines)
++    tree = ET.parse(logfile)
++    root = tree.getroot()
++    suites = root.findall("testsuite")
++    if not suites and root.tag == "testsuite":
++        suites = [root]
++    for suite in suites:
++        so = ET.SubElement(suite, "system-out")
++        so.text = content
++    tree.write(logfile, encoding="unicode")

@@ -1,0 +1,180 @@
+{
+    "id": "23acefcf-4c66-4fdd-96c2-6f8543e6688a",
+    "task_name": "kh77h5tes2y6j4ah86bm0k9hd1892x8r",
+    "trial_name": "kh77h5tes2y6j4ah86bm0k9hd1892x8r__jXtPw2W",
+    "trial_uri": "file:///work/.harbor-scratch/kh77h5tes2y6j4ah86bm0k9hd1892x8r/jobs/2026-09-03__09-11-35/kh77h5tes2y6j4ah86bm0k9hd1892x8r__jXtPw2W",
+    "task_id": {
+        "path": "/__modal/volumes/vo-RvMGBCFd2yaZZR6HWopTZK/projects/kh77h5tes2y6j4ah86bm0k9hd1892x8r"
+    },
+    "source": null,
+    "task_checksum": "31cade25d17457fc658be182234d1fac9c1c46d846af9d76efd3c15278b235d4",
+    "config": {
+        "task": {
+            "path": "/__modal/volumes/vo-RvMGBCFd2yaZZR6HWopTZK/projects/kh77h5tes2y6j4ah86bm0k9hd1892x8r",
+            "git_url": null,
+            "git_commit_id": null,
+            "name": null,
+            "ref": null,
+            "overwrite": false,
+            "download_dir": null,
+            "source": null
+        },
+        "trial_name": "kh77h5tes2y6j4ah86bm0k9hd1892x8r__jXtPw2W",
+        "trials_dir": "jobs/2026-09-03__09-11-35",
+        "install_only": false,
+        "timeout_multiplier": 1.0,
+        "agent_timeout_multiplier": null,
+        "verifier_timeout_multiplier": null,
+        "agent_setup_timeout_multiplier": null,
+        "environment_build_timeout_multiplier": null,
+        "agent": {
+            "name": "terminus-2",
+            "import_path": null,
+            "model_name": "anthropic/claude-opus-4-8",
+            "n_concurrent": null,
+            "concurrency_group": null,
+            "skills": [],
+            "override_timeout_sec": null,
+            "override_setup_timeout_sec": null,
+            "max_timeout_sec": null,
+            "resume_trajectory": false,
+            "load_trajectory": null,
+            "extra_allowed_hosts": [],
+            "kwargs": {
+                "parser_name": "xml"
+            },
+            "mcp_servers": []
+        },
+        "environment": {
+            "type": "docker",
+            "import_path": null,
+            "force_build": false,
+            "delete": true,
+            "cpu_enforcement_policy": "auto",
+            "memory_enforcement_policy": "auto",
+            "override_cpus": null,
+            "override_memory_mb": null,
+            "override_storage_mb": null,
+            "override_gpus": null,
+            "override_tpu": null,
+            "mounts": null,
+            "extra_docker_compose": [
+                "/work/pipeline/overlay-oracle.yaml"
+            ],
+            "kwargs": {},
+            "extra_allowed_hosts": []
+        },
+        "verifier": {
+            "override_timeout_sec": null,
+            "max_timeout_sec": null,
+            "disable": false
+        },
+        "artifacts": [],
+        "extra_instruction_paths": [],
+        "job_id": "2bc7d19e-1496-4c96-8ba7-c8f5647d1c0d",
+        "source_trial": null
+    },
+    "agent_info": {
+        "name": "terminus-2",
+        "version": "2.0.0",
+        "model_info": {
+            "name": "claude-opus-4-8",
+            "provider": "anthropic"
+        }
+    },
+    "agent_result": {
+        "n_input_tokens": 2821766,
+        "n_cache_tokens": 2744955,
+        "n_output_tokens": 38473,
+        "cost_usd": 2.81429875,
+        "rollout_details": [],
+        "metadata": {
+            "n_episodes": 56,
+            "api_request_times_msec": [
+                3609.5681190490723,
+                4204.120397567749,
+                24360.883474349976,
+                6683.643579483032,
+                4015.2535438537598,
+                10830.90853691101,
+                4378.043413162231,
+                12906.324625015259,
+                24441.153049468994,
+                21041.882038116455,
+                16288.648843765259,
+                20789.06774520874,
+                23515.34366607666,
+                28825.22201538086,
+                24186.160564422607,
+                5147.609233856201,
+                6053.12442779541,
+                3891.66522026062,
+                5592.4060344696045,
+                6818.569898605347,
+                3501.7306804656982,
+                5142.602920532227,
+                5720.784425735474,
+                4323.071718215942,
+                18472.647666931152,
+                4494.064569473267,
+                7084.824323654175,
+                8949.230432510376,
+                12624.038934707642,
+                6133.107423782349,
+                6920.875310897827,
+                11017.842769622803,
+                5723.839521408081,
+                9771.608829498291,
+                5111.218690872192,
+                3885.7078552246094,
+                4983.2518100738525,
+                14238.467454910278,
+                8116.774082183838,
+                9090.722560882568,
+                9447.843790054321,
+                6181.4515590667725,
+                7847.698211669922,
+                6529.669761657715,
+                14042.68479347229,
+                7564.241409301758,
+                8474.71833229065,
+                8670.586824417114,
+                10686.619997024536,
+                6933.30717086792,
+                6838.78755569458,
+                3580.9504985809326,
+                6978.188514709473,
+                6554.43811416626,
+                5144.797325134277,
+                4194.54288482666
+            ],
+            "summarization_count": 0
+        }
+    },
+    "verifier_result": {
+        "rewards": {
+            "reward": 0.0
+        }
+    },
+    "verifier_environment_mode": "shared",
+    "exception_info": null,
+    "started_at": "2026-09-03T09:11:38.570224Z",
+    "finished_at": "2026-09-03T09:32:10.899598Z",
+    "environment_setup": {
+        "started_at": "2026-09-03T09:11:38.625463Z",
+        "finished_at": "2026-09-03T09:11:39.540213Z"
+    },
+    "agent_setup": {
+        "started_at": "2026-09-03T09:11:39.540281Z",
+        "finished_at": "2026-09-03T09:11:41.181903Z"
+    },
+    "agent_execution": {
+        "started_at": "2026-09-03T09:11:41.182026Z",
+        "finished_at": "2026-09-03T09:31:42.192895Z"
+    },
+    "verifier": {
+        "started_at": "2026-09-03T09:31:42.652577Z",
+        "finished_at": "2026-09-03T09:32:00.190003Z"
+    },
+    "step_results": null
+}

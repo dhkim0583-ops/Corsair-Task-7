@@ -1,0 +1,62 @@
+diff --git a/src/_pytest/explain_deselections.py b/src/_pytest/explain_deselections.py
+new file mode 100644
+index 0000000..39ccb5e
+--- /dev/null
++++ b/src/_pytest/explain_deselections.py
+@@ -0,0 +1,46 @@
++from _pytest.config import Config
++from _pytest.config.argparsing import Parser
++
++def pytest_addoption(parser: Parser) -> None:
++    group = parser.getgroup("explain-deselections")
++    group.addoption("--explain-deselections", action="store_true", help="Report deselected tests")
++    group.addoption("--explain-deselections-verbose", action="store_true", help="List node IDs")
++    group.addoption("--explain-deselections-max-nodeids", type=int, default=0, help="Max node IDs to show")
++    group.addoption("--explain-deselections-sort-by", choices=["reason", "count", "delta"], default="reason", help="Sort order")
++    group.addoption("--explain-deselections-show-total", action="store_true", help="Print total")
++    group.addoption("--explain-deselections-show-stats", action="store_true", help="Print stats block")
++    group.addoption("--explain-deselections-reason-filter", help="Regex filter for reasons")
++    group.addoption("--explain-deselections-warn-if-exceeds", type=int, help="Warn if deselections > N")
++    group.addoption("--explain-deselections-fail-if-exceeds", type=int, help="Fail if deselections > N")
++    group.addoption("--explain-deselections-min-count", type=int, default=1, help="Min count to show")
++    group.addoption("--explain-deselections-reasons-cap", type=int, help="Cap number of reasons")
++    group.addoption("--explain-deselections-min-delta", type=int, help="Min delta to show")
++    group.addoption("--explain-deselections-output", action="append", help="Report file path")
++    group.addoption("--explain-deselections-format", choices=["text", "json", "csv"], help="Default format")
++    group.addoption("--explain-deselections-baseline", help="Baseline report file")
++    group.addoption("--explain-deselections-update-baseline", action="store_true", help="Update baseline")
++    group.addoption("--explain-deselections-fail-on-new", action="store_true", help="Fail on new reasons")
++    group.addoption("--explain-deselections-junit", choices=["none", "properties", "system-out"], help="JUnit integration")
++
++from _pytest.stash import StashKey
++DESELECTION_STATS = StashKey[dict]()
++
++def pytest_configure(config: Config) -> None:
++    if config.getoption("explain_deselections"):
++        config.stash[DESELECTION_STATS] = {}
++
++def pytest_collection_modifyitems(config: Config, items: list[nodes.Item]) -> None:
++    if DESELECTION_STATS not in config.stash:
++        return
++    # This is where we implement the logic to track removals
++    # We will need to iterate through the original list and identify what is being filtered out
++    # by the built-in filters (or by our own).
++    pass
++
++def pytest_sessionfinish(session: nodes.Session, exitstatus: int) -> None:
++    if DESELECTION_STATS in session.config.stash:
++        stats = session.config.stash[DESELECTION_STATS]
++        # Reporting logic here
++        if session.config.getoption("explain_deselections"):
++            for reason, count in stats.items():
++                print(f"deselected by {reason}: {count}")
+diff --git a/test_args.py b/test_args.py
+new file mode 100644
+index 0000000..e54c5b0
+--- /dev/null
++++ b/test_args.py
+@@ -0,0 +1,4 @@
++import pytest
++from _pytest.config import Parser
++parser = Parser()
++# Just testing the interface

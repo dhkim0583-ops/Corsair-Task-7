@@ -1,0 +1,20 @@
++ git config --global --add safe.directory '*'
++ id
++ git --version
++ ROOT=
++ for d in /app /app/* /workspace /src
++ '[' -d /app ']'
++ git -C /app rev-parse --git-dir
++ ROOT=/app
++ break
++ '[' -z /app ']'
++ '[' -z /app ']'
++ echo /app
++ git -C /app add -A -N
++ git -C /app diff --binary HEAD
++ git -C /app status --porcelain
++ git -C /app diff --stat HEAD
+++ wc -c
++ echo 'capture finished, patch bytes: 0'
+capture finished, patch bytes: 0
++ '[' 0 = 1 ']'

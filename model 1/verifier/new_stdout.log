@@ -1,0 +1,153 @@
+[new]
+python -m pytest -q --junitxml /logs/verifier/new.xml testing/test_deselection_diagnostics.py 
+......................................F..F..........................F... [ 35%]
+........................................................................ [ 70%]
+F............................................................            [100%]
+=================================== FAILURES ===================================
+_____ test_explain_deselections_junit_distinct_reasons_same_sanitized_key ______
+
+pytester = <Pytester PosixPath('/tmp/pytest-of-root/pytest-5/test_explain_deselections_junit_distinct_reasons_same_sanitized_key0')>
+
+    def test_explain_deselections_junit_distinct_reasons_same_sanitized_key(pytester):
+        dir1 = pytester.path / "grp!"
+        dir2 = pytester.path / "grp@"
+        dir1.mkdir()
+        dir2.mkdir()
+        (dir1 / "test_x.py").write_text("def test_a():\n    pass\n", encoding="utf-8")
+        (dir2 / "test_x.py").write_text("def test_a():\n    pass\n", encoding="utf-8")
+        xmlpath = pytester.path / "collision.xml"
+        result = pytester.runpytest(
+            "--import-mode=importlib",
+            "--junitxml",
+            str(xmlpath),
+            "--explain-deselections",
+            "--explain-deselections-junit",
+            "properties",
+            "-q",
+            "--deselect",
+            "grp!/test_x.py::test_a",
+            "--deselect",
+            "grp@/test_x.py::test_a",
+        )
+        assert result.ret == ExitCode.NO_TESTS_COLLECTED
+        root = ET.fromstring(xmlpath.read_text(encoding="utf-8"))
+        suite = root.find("testsuite")
+        if suite is None:
+            suite = root.find("./testsuite")
+        if suite is None:
+            suite = root.find("./testsuites/testsuite")
+        assert suite is not None
+        props = suite.find("properties")
+        assert props is not None
+        names = [p.attrib.get("name", "") for p in props.findall("property")]
+        reason_names = [
+            n for n in names if n.startswith("pytest.deselections.") and n != "pytest.deselections.total"
+        ]
+        assert len(reason_names) == 2
+>       assert len(set(reason_names)) == 2
+E       AssertionError: assert 1 == 2
+E        +  where 1 = len({'pytest.deselections.--deselectgrptest_x.pytest_a'})
+E        +    where {'pytest.deselections.--deselectgrptest_x.pytest_a'} = set(['pytest.deselections.--deselectgrptest_x.pytest_a', 'pytest.deselections.--deselectgrptest_x.pytest_a'])
+
+/app/testing/test_deselection_diagnostics.py:1057: AssertionError
+----------------------------- Captured stdout call -----------------------------
+
+deselected by --deselect grp!/test_x.py::test_a: 1
+deselected by --deselect grp@/test_x.py::test_a: 1
+2 deselected in 0.00s
+_____ test_explain_deselections_json_output_to_stdout_only_is_usage_error ______
+
+pytester = <Pytester PosixPath('/tmp/pytest-of-root/pytest-5/test_explain_deselections_json_output_to_stdout_only_is_usage_error0')>
+
+    def test_explain_deselections_json_output_to_stdout_only_is_usage_error(pytester):
+        pytester.makepyfile(
+            test_jsout="""
+            def test_keep():
+                assert True
+    
+            def test_drop():
+                assert True
+            """
+        )
+        result = pytester.runpytest(
+            "--explain-deselections",
+            "--explain-deselections-format",
+            "json",
+            "--explain-deselections-output",
+            "-",
+            "-q",
+            "-k",
+            "keep",
+        )
+>       assert result.ret != 0
+E       assert <ExitCode.OK: 0> != 0
+E        +  where <ExitCode.OK: 0> = <RunResult ret=0 len(stdout.lines)=4 len(stderr.lines)=0 duration=0.01s>.ret
+
+/app/testing/test_deselection_diagnostics.py:1152: AssertionError
+----------------------------- Captured stdout call -----------------------------
+.                                                                        [100%]
+deselected by -k keep: 1
+deselected by -k keep: 1
+1 passed, 1 deselected in 0.00s
+________________ test_explain_deselections_csv_stdout_is_error _________________
+
+pytester = <Pytester PosixPath('/tmp/pytest-of-root/pytest-5/test_explain_deselections_csv_stdout_is_error0')>
+
+    def test_explain_deselections_csv_stdout_is_error(pytester):
+        pytester.makepyfile(
+            test_csv5="""
+            def test_a():
+                assert True
+            """
+        )
+        result = pytester.runpytest(
+            "--explain-deselections",
+            "--explain-deselections-format",
+            "csv",
+            "--explain-deselections-output",
+            "-",
+            "-q",
+        )
+>       assert result.ret != 0
+E       assert <ExitCode.OK: 0> != 0
+E        +  where <ExitCode.OK: 0> = <RunResult ret=0 len(stdout.lines)=3 len(stderr.lines)=0 duration=0.01s>.ret
+
+/app/testing/test_deselection_diagnostics.py:1848: AssertionError
+----------------------------- Captured stdout call -----------------------------
+.                                                                        [100%]
+
+1 passed in 0.00s
+__________ test_explain_deselections_html_escapes_ampersand_in_reason __________
+
+pytester = <Pytester PosixPath('/tmp/pytest-of-root/pytest-5/test_explain_deselections_html_escapes_ampersand_in_reason0')>
+
+    def test_explain_deselections_html_escapes_ampersand_in_reason(pytester):
+        group_dir = pytester.path / "grp&amp"
+        group_dir.mkdir()
+        (group_dir / "test_x.py").write_text("def test_a():\n    pass\n", encoding="utf-8")
+        out_file = pytester.path / "amp.html"
+        result = pytester.runpytest(
+            "--import-mode=importlib",
+            "-q",
+            "--deselect",
+            "grp&amp/test_x.py::test_a",
+            "--explain-deselections",
+            "--explain-deselections-output",
+            str(out_file),
+        )
+        assert result.ret in (0, 5)
+        content = out_file.read_text(encoding="utf-8")
+>       assert "grp&amp;amp/test_x.py::test_a" in content
+E       AssertionError: assert 'grp&amp;amp/test_x.py::test_a' in '<!DOCTYPE html>\n<html>\n<body>\n<h1>Deselection Report</h1>\n<p><strong>Total deselected:</strong> 1</p>\n<table>\n<...</th><th>Count</th></tr>\n<tr><td>--deselect grp&amp/test_x.py::test_a</td><td>1</td></tr>\n</table>\n</body></html>\n'
+
+/app/testing/test_deselection_diagnostics.py:3662: AssertionError
+----------------------------- Captured stdout call -----------------------------
+
+deselected by --deselect grp&amp/test_x.py::test_a: 1
+1 deselected in 0.00s
+=========================== short test summary info ============================
+FAILED testing/test_deselection_diagnostics.py::test_explain_deselections_junit_distinct_reasons_same_sanitized_key
+FAILED testing/test_deselection_diagnostics.py::test_explain_deselections_json_output_to_stdout_only_is_usage_error
+FAILED testing/test_deselection_diagnostics.py::test_explain_deselections_csv_stdout_is_error
+FAILED testing/test_deselection_diagnostics.py::test_explain_deselections_html_escapes_ampersand_in_reason
+4 failed, 201 passed in 3.54s

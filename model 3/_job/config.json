@@ -1,0 +1,22 @@
+{
+    "environment": {
+        "type": "docker",
+        "extra_docker_compose": [
+            "/work/pipeline/overlay-oracle.yaml"
+        ]
+    },
+    "agents": [
+        {
+            "name": "terminus-2",
+            "model_name": "gemini/gemini-3.6-flash",
+            "kwargs": {
+                "parser_name": "xml"
+            }
+        }
+    ],
+    "tasks": [
+        {
+            "path": "/__modal/volumes/vo-RvMGBCFd2yaZZR6HWopTZK/projects/kh77h5tes2y6j4ah86bm0k9hd1892x8r"
+        }
+    ]
+}
