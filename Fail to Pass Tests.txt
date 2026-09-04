@@ -1,0 +1,5467 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 000000000..5b35c62fb
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,69 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++cd "$(dirname "$0")"
++
++MODE=""
++OUTPUT_PATH=""
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    base|new)
++      MODE="$1"
++      shift
++      ;;
++    --output_path)
++      OUTPUT_PATH="${2:-}"
++      if [[ -z "$OUTPUT_PATH" ]]; then
++        echo "missing --output_path value"
++        exit 2
++      fi
++      shift 2
++      ;;
++    --output_path=*)
++      OUTPUT_PATH="${1#--output_path=}"
++      if [[ -z "$OUTPUT_PATH" ]]; then
++        echo "missing --output_path value"
++        exit 2
++      fi
++      shift
++      ;;
++    *)
++      echo "usage: ./test.sh {base|new} [--output_path <path>]"
++      exit 1
++      ;;
++  esac
++done
++
++MODE="${MODE:-base}"
++OUTPUT_PATH="${OUTPUT_PATH:-}"
++
++export PYTHONPATH="${PWD}/src${PYTHONPATH:+:${PYTHONPATH}}"
++
++if [[ ! -f src/_pytest/_version.py ]]; then
++  printf 'version = __version__ = "9.2.0.dev0"\nversion_tuple = (9, 2, 0, "dev0")\n' > src/_pytest/_version.py
++fi
++
++if [[ -n "$OUTPUT_PATH" ]]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")"
++  printf '<?xml version="1.0" encoding="utf-8"?>\n<testsuites/>\n' > "$OUTPUT_PATH"
++fi
++
++case "$MODE" in
++  base)
++    echo "[base]"
++    CMD=(python -m pytest -q --junitxml "${OUTPUT_PATH:-/tmp/pytest-base.xml}" testing/test_helpconfig.py testing/test_terminal.py testing/test_mark.py testing/test_main.py testing/test_junitxml.py)
++    printf '%q ' "${CMD[@]}"; echo
++    "${CMD[@]}"
++    ;;
++  new)
++    echo "[new]"
++    CMD=(python -m pytest -q --junitxml "${OUTPUT_PATH:-/tmp/pytest-new.xml}" testing/test_deselection_diagnostics.py)
++    printf '%q ' "${CMD[@]}"; echo
++    "${CMD[@]}"
++    ;;
++  *)
++    echo "usage: ./test.sh {base|new} [--output_path <path>]"
++    exit 1
++    ;;
++esac
+diff --git a/testing/test_deselection_diagnostics.py b/testing/test_deselection_diagnostics.py
+new file mode 100644
+index 000000000..8e62104e2
+--- /dev/null
++++ b/testing/test_deselection_diagnostics.py
+@@ -0,0 +1,5386 @@
++from __future__ import annotations
++
++import json
++import re
++import xml.etree.ElementTree as ET
++
++from _pytest.config import ExitCode
++
++
++def _run_explain(pytester, *args: str):
++    return pytester.runpytest("--explain-deselections", *args)
++
++
++def _assert_has_line(result, line: str) -> None:
++    out = result.stdout.str()
++    assert line in out
++
++
++def _assert_not_has_line(result, fragment: str) -> None:
++    out = result.stdout.str()
++    assert fragment not in out
++
++
++def _assert_choose_from(text: str, *choices: str) -> None:
++    pattern = r"choose from\s+" + r",\s*".join(f"'?{c}'?" for c in choices)
++    assert re.search(pattern, text), text
++
++
++def test_explain_deselections_k_and_deselect(pytester):
++    pytester.makepyfile(
++        test_a="""
++        def test_one():
++            assert True
++
++        def test_one_extra():
++            assert True
++
++        def test_two():
++            assert True
++        """
++    )
++    result = _run_explain(
++        pytester,
++        "-q",
++        "-k",
++        "one",
++        "--deselect",
++        "test_a.py::test_one_extra",
++    )
++    assert result.ret == 0
++    _assert_has_line(result, "deselected by -k one: 1")
++    _assert_has_line(
++        result, "deselected by --deselect test_a.py::test_one_extra: 1"
++    )
++
++
++def test_explain_deselections_deselect_multiple_prefixes(pytester):
++    pytester.makepyfile(
++        test_multi="""
++        class TestX:
++            def test_one(self):
++                assert True
++
++            def test_two(self):
++                assert True
++
++        def test_three():
++            assert True
++        """
++    )
++    result = _run_explain(
++        pytester,
++        "-q",
++        "--deselect",
++        "test_multi.py::TestX::test_one",
++        "--deselect",
++        "test_multi.py::TestX::test_two",
++    )
++    assert result.ret == 0
++    _assert_has_line(
++        result,
++        "deselected by --deselect test_multi.py::TestX::test_one: 1",
++    )
++    _assert_has_line(
++        result,
++        "deselected by --deselect test_multi.py::TestX::test_two: 1",
++    )
++
++
++def test_explain_deselections_overlapping_deselect_prefixes_counted_once(pytester):
++    pytester.makepyfile(
++        test_overlap="""
++        class TestX:
++            def test_one(self):
++                assert True
++
++        def test_keep():
++            assert True
++        """
++    )
++    out = pytester.path / "overlap.json"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "json",
++        "--explain-deselections-output",
++        str(out),
++        "-q",
++        "--deselect",
++        "test_overlap.py::TestX",
++        "--deselect",
++        "test_overlap.py::TestX::test_one",
++    )
++    assert result.ret == 0
++    data = json.loads(out.read_text(encoding="utf-8"))
++    assert data["total_deselected"] == 1
++    reason_map = {r["reason"]: r["count"] for r in data["reasons"]}
++    assert reason_map.get("--deselect test_overlap.py::TestX") == 1
++    assert "--deselect test_overlap.py::TestX::test_one" not in reason_map
++
++
++def test_explain_deselections_cross_selector_overlap_precedence(pytester):
++    pytester.makepyfile(
++        test_xsel="""
++        import pytest
++
++        def test_keep():
++            assert True
++
++        def test_drop_k():
++            assert True
++
++        @pytest.mark.slow
++        def test_drop_both():
++            assert True
++
++        @pytest.mark.slow
++        def test_keep_slow():
++            assert True
++        """
++    )
++    out = pytester.path / "xsel.json"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "json",
++        "--explain-deselections-output",
++        str(out),
++        "-q",
++        "-k",
++        "keep",
++        "-m",
++        "not slow",
++    )
++    data = json.loads(out.read_text(encoding="utf-8"))
++    assert data["total_deselected"] == 3
++    reason_map = {r["reason"]: r["count"] for r in data["reasons"]}
++    assert reason_map.get("-k keep") == 2
++    assert reason_map.get("-m not slow") == 1
++
++
++def test_explain_deselections_deselect_takes_precedence_over_k(pytester):
++    pytester.makepyfile(
++        test_prec_k="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    out = pytester.path / "prec_k.json"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "json",
++        "--explain-deselections-output",
++        str(out),
++        "-q",
++        "-k",
++        "keep",
++        "--deselect",
++        "test_prec_k.py::test_drop",
++    )
++    assert result.ret == 0
++    data = json.loads(out.read_text(encoding="utf-8"))
++    assert data["total_deselected"] == 1
++    reason_map = {r["reason"]: r["count"] for r in data["reasons"]}
++    assert reason_map.get("--deselect test_prec_k.py::test_drop") == 1
++    assert "-k keep" not in reason_map
++
++
++def test_explain_deselections_deselect_takes_precedence_over_m(pytester):
++    pytester.makepyfile(
++        test_prec_m="""
++        import pytest
++
++        @pytest.mark.slow
++        def test_drop():
++            assert True
++
++        def test_keep():
++            assert True
++        """
++    )
++    out = pytester.path / "prec_m.json"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "json",
++        "--explain-deselections-output",
++        str(out),
++        "-q",
++        "-m",
++        "not slow",
++        "--deselect",
++        "test_prec_m.py::test_drop",
++    )
++    assert result.ret == 0
++    data = json.loads(out.read_text(encoding="utf-8"))
++    assert data["total_deselected"] == 1
++    reason_map = {r["reason"]: r["count"] for r in data["reasons"]}
++    assert reason_map.get("--deselect test_prec_m.py::test_drop") == 1
++    assert "-m not slow" not in reason_map
++
++
++def test_explain_deselections_marker(pytester):
++    pytester.makepyfile(
++        test_b="""
++        import pytest
++
++        @pytest.mark.fast
++        def test_fast():
++            assert True
++
++        def test_slow():
++            assert True
++        """
++    )
++    result = _run_explain(pytester, "-q", "-m", "fast")
++    assert result.ret == 0
++    _assert_has_line(result, "deselected by -m fast: 1")
++
++
++def test_explain_deselections_marker_with_k(pytester):
++    pytester.makepyfile(
++        test_mix="""
++        import pytest
++
++        @pytest.mark.fast
++        def test_keep_fast():
++            assert True
++
++        @pytest.mark.fast
++        def test_drop_fast():
++            assert True
++
++        def test_keep_slow():
++            assert True
++        """
++    )
++    result = _run_explain(pytester, "-q", "-k", "keep", "-m", "fast")
++    assert result.ret == 0
++    _assert_has_line(result, "deselected by -k keep: 1")
++    _assert_has_line(result, "deselected by -m fast: 1")
++
++
++def test_explain_deselections_all_deselected(pytester):
++    pytester.makepyfile(
++        test_all="""
++        def test_x():
++            assert True
++        """
++    )
++    result = _run_explain(pytester, "-q", "-k", "doesnotmatch")
++    assert result.ret == 5
++    _assert_has_line(result, "deselected by -k doesnotmatch: 1")
++
++
++def test_explain_deselections_off_by_default(pytester):
++    pytester.makepyfile(
++        test_c="""
++        def test_x():
++            assert True
++
++        def test_y():
++            assert True
++        """
++    )
++    result = pytester.runpytest("-k", "x", "-q")
++    assert result.ret == 0
++    _assert_not_has_line(result, "deselected by -k")
++    assert "--explain-deselections" in pytester.runpytest("--help").stdout.str()
++
++
++def test_explain_deselections_no_deselections_no_lines(pytester):
++    pytester.makepyfile(
++        test_none="""
++        def test_a():
++            assert True
++        """
++    )
++    result = _run_explain(pytester, "-q")
++    assert result.ret == 0
++    _assert_not_has_line(result, "deselected by -k")
++    _assert_not_has_line(result, "deselected by -m")
++    _assert_not_has_line(result, "deselected by --deselect")
++
++
++def test_explain_deselections_flag_only_has_no_effect_without_selectors(pytester):
++    pytester.makepyfile(
++        test_flag="""
++        def test_a():
++            assert True
++
++        def test_b():
++            assert True
++        """
++    )
++    result = _run_explain(pytester, "-q")
++    assert result.ret == 0
++    _assert_not_has_line(result, "deselected by")
++
++
++def test_explain_deselections_json_report_basic(pytester):
++    pytester.makepyfile(
++        test_j="""
++        def test_alpha():
++            assert True
++
++        def test_beta():
++            assert True
++        """
++    )
++    out = pytester.path / "out.json"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "json",
++        "--explain-deselections-output",
++        str(out),
++        "-q",
++        "-k",
++        "alpha",
++    )
++    assert result.ret == 0
++    text = out.read_text(encoding="utf-8")
++    data = json.loads(text)
++    assert data["total_deselected"] == 1
++    reasons = {r["reason"]: r for r in data["reasons"]}
++    assert reasons["-k alpha"]["count"] == 1
++
++
++def test_explain_deselections_json_nodeids_sampling(pytester):
++    pytester.makepyfile(
++        test_s="""
++        def test_keep_0():
++            assert True
++
++        def test_drop_0():
++            assert True
++
++        def test_drop_1():
++            assert True
++
++        def test_drop_2():
++            assert True
++        """
++    )
++    out = pytester.path / "sample.json"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "json",
++        "--explain-deselections-output",
++        str(out),
++        "--explain-deselections-max-nodeids",
++        "2",
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    data = json.loads(out.read_text(encoding="utf-8"))
++    reason = data["reasons"][0]
++    assert reason["reason"] == "-k keep"
++    assert reason["count"] == 3
++    assert len(reason["nodeids"]) == 2
++    assert all(isinstance(x, str) and x for x in reason["nodeids"])
++
++
++def test_explain_deselections_text_report_output_file(pytester):
++    pytester.makepyfile(
++        test_t="""
++        def test_keep_a():
++            assert True
++
++        def test_drop_a():
++            assert True
++        """
++    )
++    out = pytester.path / "out.txt"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out) + ":text",
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    text = out.read_text(encoding="utf-8")
++    assert "deselected by -k keep: 1" in text
++
++
++def test_explain_deselections_json_nodeids_sorted_order(pytester):
++    pytester.makepyfile(
++        test_o="""
++        def test_keep():
++            assert True
++
++        def test_drop_b():
++            assert True
++
++        def test_drop_a():
++            assert True
++        """
++    )
++    out = pytester.path / "sorted.json"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "json",
++        "--explain-deselections-output",
++        str(out),
++        "--explain-deselections-max-nodeids",
++        "2",
++        "--explain-deselections-nodeids-order",
++        "sorted",
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    data = json.loads(out.read_text(encoding="utf-8"))
++    nodeids = data["reasons"][0]["nodeids"]
++    assert nodeids == sorted(nodeids)
++
++
++def test_explain_deselections_json_requires_output(pytester):
++    pytester.makepyfile(
++        test_err="""
++        def test_a():
++            assert True
++        """
++    )
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "json",
++        "-q",
++    )
++    assert result.ret != 0
++    assert "requires --explain-deselections-output" in result.stderr.str()
++
++
++def test_explain_deselections_max_nodeids_negative_is_error(pytester):
++    pytester.makepyfile(
++        test_err2="""
++        def test_a():
++            assert True
++        """
++    )
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-max-nodeids",
++        "-1",
++        "-q",
++    )
++    assert result.ret != 0
++    assert "must be >= 0" in result.stderr.str()
++
++
++def test_explain_deselections_json_max_nodeids_zero_has_empty_nodeids(pytester):
++    pytester.makepyfile(
++        test_z="""
++        def test_keep():
++            assert True
++
++        def test_drop_1():
++            assert True
++        """
++    )
++    out = pytester.path / "z.json"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "json",
++        "--explain-deselections-output",
++        str(out),
++        "--explain-deselections-max-nodeids",
++        "0",
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    data = json.loads(out.read_text(encoding="utf-8"))
++    assert data["reasons"][0]["nodeids"] == []
++
++
++def test_explain_deselections_text_output_empty_when_no_deselections(pytester):
++    pytester.makepyfile(
++        test_e="""
++        def test_a():
++            assert True
++        """
++    )
++    out = pytester.path / "empty.txt"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out) + ":text",
++        "-q",
++    )
++    assert result.ret == 0
++    assert out.read_text(encoding="utf-8").strip() == ""
++
++
++def test_explain_deselections_json_output_empty_reasons_when_no_deselections(pytester):
++    pytester.makepyfile(
++        test_e2="""
++        def test_a():
++            assert True
++        """
++    )
++    out = pytester.path / "empty.json"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "json",
++        "--explain-deselections-output",
++        str(out),
++        "-q",
++    )
++    assert result.ret == 0
++    data = json.loads(out.read_text(encoding="utf-8"))
++    assert data["total_deselected"] == 0
++    assert data["reasons"] == []
++
++
++def test_explain_deselections_json_reasons_include_expected_entries(pytester):
++    pytester.makepyfile(
++        test_s="""
++        import pytest
++
++        @pytest.mark.fast
++        def test_fast():
++            assert True
++
++        def test_keep():
++            assert True
++
++        def test_drop_k():
++            assert True
++        """
++    )
++    out = pytester.path / "sorted_reasons.json"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "json",
++        "--explain-deselections-output",
++        str(out),
++        "-q",
++        "-k",
++        "keep",
++        "-m",
++        "fast",
++    )
++    assert result.ret in (0, 5)
++    data = json.loads(out.read_text(encoding="utf-8"))
++    reasons = {r["reason"] for r in data["reasons"]}
++    assert "-k keep" in reasons
++    assert "-m fast" in reasons
++
++
++def test_explain_deselections_json_total_is_sum_of_counts(pytester):
++    pytester.makepyfile(
++        test_t="""
++        def test_keep():
++            assert True
++
++        def test_drop_1():
++            assert True
++
++        def test_drop_2():
++            assert True
++        """
++    )
++    out = pytester.path / "total.json"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "json",
++        "--explain-deselections-output",
++        str(out),
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    data = json.loads(out.read_text(encoding="utf-8"))
++    total = data["total_deselected"]
++    s = sum(r["count"] for r in data["reasons"])
++    assert total == s
++
++
++def test_explain_deselections_nodeids_order_encountered_is_deterministic(pytester):
++    pytester.makepyfile(
++        test_o="""
++        def test_keep():
++            assert True
++
++        def test_drop_c():
++            assert True
++
++        def test_drop_a():
++            assert True
++
++        def test_drop_b():
++            assert True
++        """
++    )
++    out = pytester.path / "enc.json"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "json",
++        "--explain-deselections-output",
++        str(out),
++        "--explain-deselections-max-nodeids",
++        "3",
++        "--explain-deselections-nodeids-order",
++        "encountered",
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    data = json.loads(out.read_text(encoding="utf-8"))
++    nodeids = data["reasons"][0]["nodeids"]
++    assert len(nodeids) == 3
++    assert len(set(nodeids)) == 3
++    assert nodeids == [
++        "test_o.py::test_drop_c",
++        "test_o.py::test_drop_a",
++        "test_o.py::test_drop_b",
++    ]
++
++
++def test_explain_deselections_invalid_nodeids_order_is_usage_error(pytester):
++    pytester.makepyfile(
++        test_u="""
++        def test_a():
++            assert True
++        """
++    )
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-nodeids-order",
++        "nope",
++        "-q",
++    )
++    assert result.ret != 0
++    _assert_choose_from(result.stderr.str(), "encountered", "sorted")
++
++
++def test_explain_deselections_invalid_junit_mode_is_usage_error(pytester):
++    pytester.makepyfile(
++        test_ujm="""
++        def test_a():
++            assert True
++        """
++    )
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-junit",
++        "nope",
++        "-q",
++    )
++    assert result.ret != 0
++    _assert_choose_from(result.stderr.str(), "none", "properties", "system-out")
++
++
++def test_explain_deselections_invalid_format_is_usage_error(pytester):
++    pytester.makepyfile(
++        test_u2="""
++        def test_a():
++            assert True
++        """
++    )
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "nope",
++        "-q",
++    )
++    assert result.ret != 0
++    _assert_choose_from(result.stderr.str(), "text", "json", "csv")
++
++
++def test_explain_deselections_format_md_is_not_a_cli_choice(pytester):
++    pytester.makepyfile(
++        test_u3="""
++        def test_a():
++            assert True
++        """
++    )
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "md",
++        "-q",
++    )
++    assert result.ret != 0
++    _assert_choose_from(result.stderr.str(), "text", "json", "csv")
++
++
++def test_explain_deselections_format_html_is_not_a_cli_choice(pytester):
++    pytester.makepyfile(
++        test_u4="""
++        def test_a():
++            assert True
++        """
++    )
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "html",
++        "-q",
++    )
++    assert result.ret != 0
++    _assert_choose_from(result.stderr.str(), "text", "json", "csv")
++
++
++def test_explain_deselections_text_output_file_contains_deselection_lines(pytester):
++    pytester.makepyfile(
++        test_n="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    out = pytester.path / "nl.txt"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out) + ":text",
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    text = out.read_text(encoding="utf-8")
++    assert "deselected by -k keep: 1" in text
++
++
++def test_explain_deselections_json_schema_has_expected_keys(pytester):
++    pytester.makepyfile(
++        test_sch="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    out = pytester.path / "schema.json"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "json",
++        "--explain-deselections-output",
++        str(out),
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    data = json.loads(out.read_text(encoding="utf-8"))
++    assert "reasons" in data
++    assert "total_deselected" in data
++    r0 = data["reasons"][0]
++    assert "reason" in r0
++    assert "count" in r0
++    assert "nodeids" in r0
++
++
++def test_explain_deselections_json_schema_version_is_present_and_int(pytester):
++    pytester.makepyfile(
++        test_sv="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    out = pytester.path / "sv.json"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "json",
++        "--explain-deselections-output",
++        str(out),
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    data = json.loads(out.read_text(encoding="utf-8"))
++    assert "schema_version" in data
++    assert data["schema_version"] == 1
++
++
++def test_explain_deselections_json_nodeids_respects_max_nodeids(pytester):
++    pytester.makepyfile(
++        test_m="""
++        def test_keep():
++            assert True
++
++        def test_drop_1():
++            assert True
++
++        def test_drop_2():
++            assert True
++
++        def test_drop_3():
++            assert True
++        """
++    )
++    out = pytester.path / "max.json"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "json",
++        "--explain-deselections-output",
++        str(out),
++        "--explain-deselections-max-nodeids",
++        "1",
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    data = json.loads(out.read_text(encoding="utf-8"))
++    assert len(data["reasons"][0]["nodeids"]) == 1
++
++
++def test_explain_deselections_text_output_multiple_lines_for_multiple_reasons(pytester):
++    pytester.makepyfile(
++        test_ml="""
++        import pytest
++
++        @pytest.mark.fast
++        def test_fast_keep():
++            assert True
++
++        def test_slow_keep():
++            assert True
++
++        @pytest.mark.fast
++        def test_fast_drop():
++            assert True
++        """
++    )
++    out = pytester.path / "multi.txt"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out) + ":text",
++        "-q",
++        "-m",
++        "fast",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    text = out.read_text(encoding="utf-8")
++    assert "deselected by -k keep:" in text
++
++
++def test_explain_deselections_multiple_output_files_written(pytester):
++    pytester.makepyfile(
++        test_mo="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    out1 = pytester.path / "a.txt"
++    out2 = pytester.path / "b.txt"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out1) + ":text",
++        "--explain-deselections-output",
++        str(out2) + ":text",
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    t1 = out1.read_text(encoding="utf-8")
++    t2 = out2.read_text(encoding="utf-8")
++    assert "deselected by -k keep: 1" in t1
++    assert "deselected by -k keep: 1" in t2
++
++
++def test_explain_deselections_output_format_override_json_and_text(pytester):
++    pytester.makepyfile(
++        test_of="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    out_json = pytester.path / "o.json"
++    out_txt = pytester.path / "o.txt"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out_json) + ":json",
++        "--explain-deselections-output",
++        str(out_txt) + ":text",
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    data = json.loads(out_json.read_text(encoding="utf-8"))
++    assert data["total_deselected"] == 1
++    text = out_txt.read_text(encoding="utf-8")
++    assert "deselected by -k keep: 1" in text
++
++
++def test_explain_deselections_output_dash_writes_text_to_stdout(pytester):
++    pytester.makepyfile(
++        test_dash="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-output",
++        "-",
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    out = result.stdout.str()
++    assert "deselected by -k keep: 1" in out
++
++
++def test_explain_deselections_junit_properties_attached(pytester):
++    pytester.makepyfile(
++        test_jp="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    xmlpath = pytester.path / "out.xml"
++    result = pytester.runpytest(
++        "--junitxml",
++        str(xmlpath),
++        "--explain-deselections",
++        "--explain-deselections-junit",
++        "properties",
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    root = ET.fromstring(xmlpath.read_text(encoding="utf-8"))
++    suite = root.find("testsuite")
++    if suite is None:
++        suite = root.find("./testsuite")
++    if suite is None:
++        suite = root.find("./testsuites/testsuite")
++    assert suite is not None
++    props = suite.find("properties")
++    assert props is not None
++    props_list = props.findall("property")
++    assert props_list
++    names = {p.attrib.get("name", "") for p in props_list}
++    values_by_name = {p.attrib.get("name", ""): p.attrib.get("value", "") for p in props_list}
++    assert "pytest.deselections.total" in names
++    assert values_by_name["pytest.deselections.total"].isdigit()
++    assert all(n.startswith("pytest.deselections.") for n in names)
++    assert any(n != "pytest.deselections.total" and n.startswith("pytest.deselections.") for n in names)
++    assert all(v.isdigit() for v in values_by_name.values())
++    import re as _re
++    assert all(_re.match(r"^pytest\.deselections\.[A-Za-z0-9_.-]+$", n) for n in names)
++
++
++def test_explain_deselections_junit_distinct_reasons_same_sanitized_key(pytester):
++    dir1 = pytester.path / "grp!"
++    dir2 = pytester.path / "grp@"
++    dir1.mkdir()
++    dir2.mkdir()
++    (dir1 / "test_x.py").write_text("def test_a():\n    pass\n", encoding="utf-8")
++    (dir2 / "test_x.py").write_text("def test_a():\n    pass\n", encoding="utf-8")
++    xmlpath = pytester.path / "collision.xml"
++    result = pytester.runpytest(
++        "--import-mode=importlib",
++        "--junitxml",
++        str(xmlpath),
++        "--explain-deselections",
++        "--explain-deselections-junit",
++        "properties",
++        "-q",
++        "--deselect",
++        "grp!/test_x.py::test_a",
++        "--deselect",
++        "grp@/test_x.py::test_a",
++    )
++    assert result.ret == ExitCode.NO_TESTS_COLLECTED
++    root = ET.fromstring(xmlpath.read_text(encoding="utf-8"))
++    suite = root.find("testsuite")
++    if suite is None:
++        suite = root.find("./testsuite")
++    if suite is None:
++        suite = root.find("./testsuites/testsuite")
++    assert suite is not None
++    props = suite.find("properties")
++    assert props is not None
++    names = [p.attrib.get("name", "") for p in props.findall("property")]
++    reason_names = [
++        n for n in names if n.startswith("pytest.deselections.") and n != "pytest.deselections.total"
++    ]
++    assert len(reason_names) == 2
++    assert len(set(reason_names)) == 2
++
++
++def test_explain_deselections_junit_system_out_attached(pytester):
++    pytester.makepyfile(
++        test_js="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    xmlpath = pytester.path / "out2.xml"
++    result = pytester.runpytest(
++        "--junitxml",
++        str(xmlpath),
++        "--explain-deselections",
++        "--explain-deselections-junit",
++        "system-out",
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    root = ET.fromstring(xmlpath.read_text(encoding="utf-8"))
++    suite = root.find("testsuite")
++    if suite is None:
++        suite = root.find("./testsuite")
++    if suite is None:
++        suite = root.find("./testsuites/testsuite")
++    assert suite is not None
++    node = suite.find("system-out")
++    assert node is not None
++    assert "deselected by -k keep: 1" in (node.text or "")
++
++
++def test_explain_deselections_junit_none_does_not_attach(pytester):
++    pytester.makepyfile(
++        test_jn="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    xmlpath = pytester.path / "none.xml"
++    result = pytester.runpytest(
++        "--junitxml",
++        str(xmlpath),
++        "--explain-deselections",
++        "--explain-deselections-junit",
++        "none",
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    root = ET.fromstring(xmlpath.read_text(encoding="utf-8"))
++    suite = root.find("testsuite")
++    if suite is None:
++        suite = root.find("./testsuite")
++    if suite is None:
++        suite = root.find("./testsuites/testsuite")
++    assert suite is not None
++    out_node = suite.find("system-out")
++    if out_node is not None:
++        assert "deselected by -k keep" not in (out_node.text or "")
++    props = suite.find("properties")
++    if props is not None:
++        names = {p.attrib.get("name", "") for p in props.findall("property")}
++        assert not any("deselection" in n for n in names)
++
++
++def test_explain_deselections_json_output_to_stdout_only_is_usage_error(pytester):
++    pytester.makepyfile(
++        test_jsout="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "json",
++        "--explain-deselections-output",
++        "-",
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret != 0
++    assert "requires --explain-deselections-output" in result.stderr.str()
++
++
++def test_explain_deselections_text_output_matches_terminal_lines_subset(pytester):
++    pytester.makepyfile(
++        test_m="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    out = pytester.path / "match.txt"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out) + ":text",
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    text = out.read_text(encoding="utf-8")
++    assert "deselected by -k keep: 1" in result.stdout.str()
++    assert "deselected by -k keep: 1" in text
++
++
++
++def test_explain_deselections_json_nodeids_sorted_is_deterministic(pytester):
++    pytester.makepyfile(
++        test_d="""
++        def test_keep():
++            assert True
++
++        def test_drop_z():
++            assert True
++
++        def test_drop_a():
++            assert True
++        """
++    )
++    out = pytester.path / "det.json"
++    args = (
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "json",
++        "--explain-deselections-output",
++        str(out),
++        "--explain-deselections-max-nodeids",
++        "2",
++        "--explain-deselections-nodeids-order",
++        "sorted",
++        "-q",
++        "-k",
++        "keep",
++    )
++    result1 = pytester.runpytest(*args)
++    assert result1.ret == 0
++    text1 = out.read_text(encoding="utf-8")
++    result2 = pytester.runpytest(*args)
++    assert result2.ret == 0
++    text2 = out.read_text(encoding="utf-8")
++    assert text1 == text2
++
++
++def test_explain_deselections_text_output_is_deterministic(pytester):
++    pytester.makepyfile(
++        test_d2="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    out = pytester.path / "det.txt"
++    args = (
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out) + ":text",
++        "--explain-deselections-sort-by", "reason",
++        "-q",
++        "-k",
++        "keep",
++    )
++    r1 = pytester.runpytest(*args)
++    assert r1.ret == 0
++    t1 = out.read_text(encoding="utf-8")
++    r2 = pytester.runpytest(*args)
++    assert r2.ret == 0
++    t2 = out.read_text(encoding="utf-8")
++    assert t1 == t2
++
++
++def test_explain_deselections_deselect_reason_appears_in_json(pytester):
++    pytester.makepyfile(
++        test_de="""
++        def test_a():
++            assert True
++
++        def test_b():
++            assert True
++        """
++    )
++    out = pytester.path / "deselect.json"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "json",
++        "--explain-deselections-output",
++        str(out),
++        "-q",
++        "--deselect",
++        "test_de.py::test_b",
++    )
++    assert result.ret == 0
++    data = json.loads(out.read_text(encoding="utf-8"))
++    reasons = [r["reason"] for r in data["reasons"]]
++    assert "--deselect test_de.py::test_b" in reasons
++
++
++def test_explain_deselections_deselect_reason_appears_in_text_file(pytester):
++    pytester.makepyfile(
++        test_de2="""
++        def test_a():
++            assert True
++
++        def test_b():
++            assert True
++        """
++    )
++    out = pytester.path / "deselect.txt"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out) + ":text",
++        "-q",
++        "--deselect",
++        "test_de2.py::test_b",
++    )
++    assert result.ret == 0
++    text = out.read_text(encoding="utf-8")
++    assert "deselected by --deselect test_de2.py::test_b: 1" in text
++
++
++def test_explain_deselections_multiple_deselects_have_multiple_reasons(pytester):
++    pytester.makepyfile(
++        test_md="""
++        def test_a():
++            assert True
++
++        def test_b():
++            assert True
++
++        def test_c():
++            assert True
++        """
++    )
++    out = pytester.path / "md.json"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "json",
++        "--explain-deselections-output",
++        str(out),
++        "-q",
++        "--deselect",
++        "test_md.py::test_b",
++        "--deselect",
++        "test_md.py::test_c",
++    )
++    assert result.ret == 0
++    data = json.loads(out.read_text(encoding="utf-8"))
++    reasons = [r["reason"] for r in data["reasons"]]
++    assert "--deselect test_md.py::test_b" in reasons
++    assert "--deselect test_md.py::test_c" in reasons
++
++
++def test_explain_deselections_multiple_reasons_counts_are_positive(pytester):
++    pytester.makepyfile(
++        test_mp="""
++        import pytest
++
++        @pytest.mark.fast
++        def test_fast_keep():
++            assert True
++
++        def test_slow_keep():
++            assert True
++
++        def test_slow_drop():
++            assert True
++        """
++    )
++    out = pytester.path / "pos.json"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "json",
++        "--explain-deselections-output",
++        str(out),
++        "-q",
++        "-m",
++        "fast",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    data = json.loads(out.read_text(encoding="utf-8"))
++    assert all(r["count"] > 0 for r in data["reasons"])
++
++
++def test_explain_deselections_output_path_in_subdir(pytester):
++    pytester.makepyfile(
++        test_sd="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    out = pytester.path / "sub" / "out.json"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "json",
++        "--explain-deselections-output",
++        str(out),
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    assert out.is_file()
++
++
++def test_explain_deselections_text_output_path_in_subdir(pytester):
++    pytester.makepyfile(
++        test_sd2="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    out = pytester.path / "subt" / "out.txt"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out) + ":text",
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    assert out.is_file()
++
++
++def test_explain_deselections_output_file_overwrites_previous(pytester):
++    pytester.makepyfile(
++        test_ow="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    out = pytester.path / "overwrite.txt"
++    out.write_text("old\n", encoding="utf-8")
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out) + ":text",
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    assert out.read_text(encoding="utf-8") != "old\n"
++
++
++def test_explain_deselections_json_output_overwrites_previous(pytester):
++    pytester.makepyfile(
++        test_ow2="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    out = pytester.path / "overwrite.json"
++    out.write_text("{}\n", encoding="utf-8")
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "json",
++        "--explain-deselections-output",
++        str(out),
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    assert out.read_text(encoding="utf-8") != "{}\n"
++
++
++def test_explain_deselections_terminal_has_no_lines_when_disabled(pytester):
++    pytester.makepyfile(
++        test_off="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    result = pytester.runpytest("-q", "-k", "keep")
++    assert result.ret == 0
++    assert "deselected by -k" not in result.stdout.str()
++    assert "--explain-deselections" in pytester.runpytest("--help").stdout.str()
++
++
++def test_explain_deselections_terminal_has_lines_when_enabled(pytester):
++    pytester.makepyfile(
++        test_on="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    result = pytester.runpytest("--explain-deselections", "-q", "-k", "keep")
++    assert result.ret == 0
++    assert "deselected by -k keep: 1" in result.stdout.str()
++
++
++def test_explain_deselections_marker_reason_in_json(pytester):
++    pytester.makepyfile(
++        test_mj="""
++        import pytest
++
++        @pytest.mark.fast
++        def test_fast():
++            assert True
++
++        def test_slow():
++            assert True
++        """
++    )
++    out = pytester.path / "mark.json"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "json",
++        "--explain-deselections-output",
++        str(out),
++        "-q",
++        "-m",
++        "fast",
++    )
++    assert result.ret == 0
++    data = json.loads(out.read_text(encoding="utf-8"))
++    assert any(r["reason"] == "-m fast" for r in data["reasons"])
++
++
++def test_explain_deselections_marker_reason_in_text(pytester):
++    pytester.makepyfile(
++        test_mt="""
++        import pytest
++
++        @pytest.mark.fast
++        def test_fast():
++            assert True
++
++        def test_slow():
++            assert True
++        """
++    )
++    out = pytester.path / "mark.txt"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out) + ":text",
++        "-q",
++        "-m",
++        "fast",
++    )
++    assert result.ret == 0
++    assert "deselected by -m fast: 1" in out.read_text(encoding="utf-8")
++
++
++def test_explain_deselections_k_reason_in_json(pytester):
++    pytester.makepyfile(
++        test_kj="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    out = pytester.path / "k.json"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "json",
++        "--explain-deselections-output",
++        str(out),
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    data = json.loads(out.read_text(encoding="utf-8"))
++    assert any(r["reason"] == "-k keep" for r in data["reasons"])
++
++
++
++
++def test_explain_deselections_text_output_contains_only_lines(pytester):
++    pytester.makepyfile(
++        test_tl="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    out = pytester.path / "only.txt"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out) + ":text",
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    lines = [l for l in out.read_text(encoding="utf-8").splitlines() if l]
++    assert any("deselected by -k keep: 1" in l for l in lines)
++
++
++def test_explain_deselections_text_output_has_one_line_for_single_reason(pytester):
++    pytester.makepyfile(
++        test_1="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    out = pytester.path / "one.txt"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out) + ":text",
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    assert "deselected by -k keep: 1" in out.read_text(encoding="utf-8")
++
++
++def test_explain_deselections_json_one_reason_for_single_selector(pytester):
++    pytester.makepyfile(
++        test_2="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    out = pytester.path / "one.json"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "json",
++        "--explain-deselections-output",
++        str(out),
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    data = json.loads(out.read_text(encoding="utf-8"))
++    assert len(data["reasons"]) == 1
++
++
++def test_explain_deselections_json_reason_field_nonempty(pytester):
++    pytester.makepyfile(
++        test_ne="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    out = pytester.path / "nonempty.json"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "json",
++        "--explain-deselections-output",
++        str(out),
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    data = json.loads(out.read_text(encoding="utf-8"))
++    assert data["reasons"][0]["reason"]
++
++
++def test_explain_deselections_text_output_reason_field_nonempty(pytester):
++    pytester.makepyfile(
++        test_nt="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    out = pytester.path / "nonempty.txt"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out) + ":text",
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    text = out.read_text(encoding="utf-8")
++    assert "deselected by -k keep:" in text
++
++
++def test_explain_deselections_csv_format_has_header_and_rows(pytester):
++    pytester.makepyfile(
++        test_csv1="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    out = pytester.path / "out.csv"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "csv",
++        "--explain-deselections-output",
++        str(out),
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    text = out.read_text(encoding="utf-8")
++    lines = text.splitlines()
++    assert lines[0] == "reason,count"
++    assert any("-k keep" in l for l in lines[1:])
++
++
++def test_explain_deselections_csv_quotes_reason_containing_comma(pytester):
++    import csv as _csv
++
++    group_dir = pytester.path / "grp,comma"
++    group_dir.mkdir()
++    (group_dir / "test_x.py").write_text("def test_a():\n    pass\n", encoding="utf-8")
++    out = pytester.path / "comma.csv"
++    result = pytester.runpytest(
++        "--import-mode=importlib",
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "csv",
++        "--explain-deselections-output",
++        str(out),
++        "-q",
++        "--deselect",
++        "grp,comma/test_x.py::test_a",
++    )
++    assert result.ret in (0, 5)
++    with out.open(newline="", encoding="utf-8") as f:
++        rows = list(_csv.reader(f))
++    rows = [r for r in rows if r]
++    assert rows[0] == ["reason", "count"]
++    assert rows[1] == ["--deselect grp,comma/test_x.py::test_a", "1"]
++
++
++def test_explain_deselections_csv_format_requires_file_output(pytester):
++    pytester.makepyfile(
++        test_csv2="""
++        def test_a():
++            assert True
++        """
++    )
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "csv",
++        "-q",
++    )
++    assert result.ret != 0
++    assert "requires --explain-deselections-output" in result.stderr.str()
++
++
++def test_explain_deselections_csv_format_with_path_override(pytester):
++    pytester.makepyfile(
++        test_csv3="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    out_csv = pytester.path / "override.csv"
++    out_txt = pytester.path / "override.txt"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out_csv) + ":csv",
++        "--explain-deselections-output",
++        str(out_txt) + ":text",
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    csv_text = out_csv.read_text(encoding="utf-8")
++    assert "reason,count" in csv_text
++    assert "-k keep" in csv_text
++    txt_text = out_txt.read_text(encoding="utf-8")
++    assert "deselected by -k keep: 1" in txt_text
++
++
++def test_explain_deselections_csv_format_multiple_reasons(pytester):
++    pytester.makepyfile(
++        test_csv4="""
++        import pytest
++
++        @pytest.mark.fast
++        def test_fast():
++            assert True
++
++        def test_slow():
++            assert True
++        """
++    )
++    out = pytester.path / "multi.csv"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "csv",
++        "--explain-deselections-output",
++        str(out),
++        "-q",
++        "-m",
++        "fast",
++    )
++    assert result.ret == 0
++    text = out.read_text(encoding="utf-8")
++    lines = [l for l in text.splitlines() if l]
++    assert lines[0] == "reason,count"
++    assert len(lines) >= 2
++
++
++def test_explain_deselections_csv_stdout_is_error(pytester):
++    pytester.makepyfile(
++        test_csv5="""
++        def test_a():
++            assert True
++        """
++    )
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "csv",
++        "--explain-deselections-output",
++        "-",
++        "-q",
++    )
++    assert result.ret != 0
++    assert "requires --explain-deselections-output" in result.stderr.str()
++
++
++def test_explain_deselections_min_count_filters_terminal(pytester):
++    pytester.makepyfile(
++        test_mc1="""
++        import pytest
++
++        @pytest.mark.fast
++        def test_fast():
++            assert True
++
++        def test_slow_1():
++            assert True
++
++        def test_slow_2():
++            assert True
++
++        def test_slow_3():
++            assert True
++        """
++    )
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-min-count",
++        "5",
++        "-q",
++        "-m",
++        "fast",
++    )
++    assert result.ret == 0
++    assert "deselected by -m fast" not in result.stdout.str()
++
++
++def test_explain_deselections_min_count_passes_at_threshold(pytester):
++    pytester.makepyfile(
++        test_mc2="""
++        def test_keep():
++            assert True
++
++        def test_drop_1():
++            assert True
++
++        def test_drop_2():
++            assert True
++        """
++    )
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-min-count",
++        "2",
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    assert "deselected by -k keep: 2" in result.stdout.str()
++
++
++def test_explain_deselections_min_count_suppresses_in_json(pytester):
++    pytester.makepyfile(
++        test_mc3="""
++        import pytest
++
++        @pytest.mark.fast
++        def test_fast():
++            assert True
++
++        def test_slow_1():
++            assert True
++
++        def test_slow_2():
++            assert True
++
++        def test_slow_3():
++            assert True
++        """
++    )
++    out = pytester.path / "mc.json"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "json",
++        "--explain-deselections-output",
++        str(out),
++        "--explain-deselections-min-count",
++        "5",
++        "-q",
++        "-m",
++        "fast",
++    )
++    assert result.ret == 0
++    data = json.loads(out.read_text(encoding="utf-8"))
++    assert data["total_deselected"] == 3
++    assert data["reasons"] == []
++
++
++def test_explain_deselections_min_count_with_junit_total_preserved(pytester):
++    pytester.makepyfile(
++        test_mcj="""
++        import pytest
++
++        @pytest.mark.fast
++        def test_fast():
++            assert True
++
++        def test_slow_1():
++            assert True
++
++        def test_slow_2():
++            assert True
++
++        def test_slow_3():
++            assert True
++        """
++    )
++    xmlpath = pytester.path / "mcj.xml"
++    result = pytester.runpytest(
++        "--junitxml",
++        str(xmlpath),
++        "--explain-deselections",
++        "--explain-deselections-junit",
++        "properties",
++        "--explain-deselections-min-count",
++        "5",
++        "-q",
++        "-m",
++        "fast",
++    )
++    assert result.ret == 0
++    root = ET.fromstring(xmlpath.read_text(encoding="utf-8"))
++    suite = root.find("testsuite")
++    if suite is None:
++        suite = root.find("./testsuite")
++    if suite is None:
++        suite = root.find("./testsuites/testsuite")
++    assert suite is not None
++    props = suite.find("properties")
++    assert props is not None
++    values_by_name = {p.attrib.get("name", ""): p.attrib.get("value", "") for p in props.findall("property")}
++    assert int(values_by_name["pytest.deselections.total"]) == 3
++    reason_names = [n for n in values_by_name if n != "pytest.deselections.total"]
++    assert reason_names == []
++
++
++def test_explain_deselections_min_count_total_preserved_in_json(pytester):
++    pytester.makepyfile(
++        test_mc4="""
++        def test_keep():
++            assert True
++
++        def test_drop_1():
++            assert True
++
++        def test_drop_2():
++            assert True
++        """
++    )
++    out = pytester.path / "mc_total.json"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "json",
++        "--explain-deselections-output",
++        str(out),
++        "--explain-deselections-min-count",
++        "10",
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    data = json.loads(out.read_text(encoding="utf-8"))
++    assert data["total_deselected"] == 2
++    assert data["reasons"] == []
++
++
++def test_explain_deselections_min_count_below_one_is_error(pytester):
++    pytester.makepyfile(
++        test_mc5="""
++        def test_a():
++            assert True
++        """
++    )
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-min-count",
++        "0",
++        "-q",
++    )
++    assert result.ret != 0
++    assert "must be >= 1" in result.stderr.str()
++
++
++def test_explain_deselections_min_count_negative_is_error(pytester):
++    pytester.makepyfile(
++        test_mc6="""
++        def test_a():
++            assert True
++        """
++    )
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-min-count",
++        "-1",
++        "-q",
++    )
++    assert result.ret != 0
++    assert "must be >= 1" in result.stderr.str()
++
++
++def test_explain_deselections_fail_if_exceeds_when_exceeded(pytester):
++    pytester.makepyfile(
++        test_fe1="""
++        def test_keep():
++            assert True
++
++        def test_drop_1():
++            assert True
++
++        def test_drop_2():
++            assert True
++        """
++    )
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-fail-if-exceeds",
++        "1",
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret != 0
++    assert "DESELECTION THRESHOLD EXCEEDED" in result.stdout.str()
++
++
++def test_explain_deselections_fail_if_exceeds_when_not_exceeded(pytester):
++    pytester.makepyfile(
++        test_fe2="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-fail-if-exceeds",
++        "5",
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++
++
++def test_explain_deselections_fail_if_exceeds_not_triggered_when_equal(pytester):
++    pytester.makepyfile(
++        test_feeq="""
++        def test_keep():
++            assert True
++
++        def test_drop_1():
++            assert True
++
++        def test_drop_2():
++            assert True
++        """
++    )
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-fail-if-exceeds",
++        "2",
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    assert "DESELECTION THRESHOLD EXCEEDED" not in result.stdout.str()
++
++
++def test_explain_deselections_fail_if_exceeds_zero_any_deselection_fails(pytester):
++    pytester.makepyfile(
++        test_fe3="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-fail-if-exceeds",
++        "0",
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret != 0
++    assert "DESELECTION THRESHOLD EXCEEDED" in result.stdout.str()
++
++
++def test_explain_deselections_fail_if_exceeds_negative_is_error(pytester):
++    pytester.makepyfile(
++        test_fe4="""
++        def test_a():
++            assert True
++        """
++    )
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-fail-if-exceeds",
++        "-1",
++        "-q",
++    )
++    assert result.ret != 0
++    assert "must be >= 0" in result.stderr.str()
++
++
++def test_explain_deselections_fail_if_exceeds_prints_exceeded_message(pytester):
++    pytester.makepyfile(
++        test_fe5="""
++        def test_keep():
++            assert True
++
++        def test_drop_1():
++            assert True
++
++        def test_drop_2():
++            assert True
++        """
++    )
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-fail-if-exceeds",
++        "0",
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret != 0
++    assert "DESELECTION THRESHOLD EXCEEDED: 2 tests deselected (threshold: 0)" in result.stdout.str()
++
++
++def test_explain_deselections_baseline_shows_delta_in_terminal(pytester):
++    pytester.makepyfile(
++        test_bl1="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    baseline = pytester.path / "baseline.json"
++    baseline.write_text(
++        '{"schema_version": 1, "total_deselected": 0, "reasons": []}',
++        encoding="utf-8",
++    )
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-baseline",
++        str(baseline),
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    out = result.stdout.str()
++    assert "deselected by -k keep: 1" in out
++    assert "(new)" in out
++
++
++def test_explain_deselections_baseline_shows_new_for_unknown_reason(pytester):
++    pytester.makepyfile(
++        test_bl2="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    baseline = pytester.path / "baseline2.json"
++    baseline.write_text(
++        '{"schema_version": 1, "total_deselected": 0, "reasons": []}',
++        encoding="utf-8",
++    )
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-baseline",
++        str(baseline),
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    assert "(new)" in result.stdout.str()
++
++
++def test_explain_deselections_baseline_shows_delta_when_count_increased(pytester):
++    pytester.makepyfile(
++        test_bl3="""
++        def test_keep():
++            assert True
++
++        def test_drop_1():
++            assert True
++
++        def test_drop_2():
++            assert True
++        """
++    )
++    baseline = pytester.path / "baseline3.json"
++    baseline.write_text(
++        '{"schema_version": 1, "total_deselected": 1, "reasons": [{"reason": "-k keep", "count": 1, "nodeids": []}]}',
++        encoding="utf-8",
++    )
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-baseline",
++        str(baseline),
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    out = result.stdout.str()
++    assert "(+1)" in out
++
++
++def test_explain_deselections_baseline_json_has_delta_field(pytester):
++    pytester.makepyfile(
++        test_bl4="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    baseline = pytester.path / "baseline4.json"
++    baseline.write_text(
++        '{"schema_version": 1, "total_deselected": 0, "reasons": []}',
++        encoding="utf-8",
++    )
++    out = pytester.path / "bl4.json"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "json",
++        "--explain-deselections-output",
++        str(out),
++        "--explain-deselections-baseline",
++        str(baseline),
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    data = json.loads(out.read_text(encoding="utf-8"))
++    r = data["reasons"][0]
++    assert "delta" in r
++    assert isinstance(r["delta"], int)
++
++
++def test_explain_deselections_baseline_json_has_baseline_count_field(pytester):
++    pytester.makepyfile(
++        test_bl5="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    baseline = pytester.path / "baseline5.json"
++    baseline.write_text(
++        '{"schema_version": 1, "total_deselected": 0, "reasons": []}',
++        encoding="utf-8",
++    )
++    out = pytester.path / "bl5.json"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "json",
++        "--explain-deselections-output",
++        str(out),
++        "--explain-deselections-baseline",
++        str(baseline),
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    data = json.loads(out.read_text(encoding="utf-8"))
++    r = data["reasons"][0]
++    assert "baseline_count" in r
++    assert isinstance(r["baseline_count"], int)
++
++
++def test_explain_deselections_baseline_json_has_total_fields(pytester):
++    pytester.makepyfile(
++        test_bl6="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    baseline = pytester.path / "baseline6.json"
++    baseline.write_text(
++        '{"schema_version": 1, "total_deselected": 0, "reasons": []}',
++        encoding="utf-8",
++    )
++    out = pytester.path / "bl6.json"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "json",
++        "--explain-deselections-output",
++        str(out),
++        "--explain-deselections-baseline",
++        str(baseline),
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    data = json.loads(out.read_text(encoding="utf-8"))
++    assert "baseline_total_deselected" in data
++    assert "total_delta" in data
++    assert isinstance(data["baseline_total_deselected"], int)
++    assert isinstance(data["total_delta"], int)
++    assert data["baseline_total_deselected"] == 0
++    assert data["total_delta"] == 1
++
++
++def test_explain_deselections_baseline_nonexistent_file_is_error(pytester):
++    pytester.makepyfile(
++        test_bl7="""
++        def test_a():
++            assert True
++        """
++    )
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-baseline",
++        "/nonexistent/path/baseline.json",
++        "-q",
++    )
++    assert result.ret != 0
++    assert "file not found" in result.stderr.str()
++
++
++def test_explain_deselections_baseline_invalid_json_is_error(pytester):
++    pytester.makepyfile(
++        test_bl8="""
++        def test_a():
++            assert True
++        """
++    )
++    bad_baseline = pytester.path / "bad.json"
++    bad_baseline.write_text("not valid json {{{", encoding="utf-8")
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-baseline",
++        str(bad_baseline),
++        "-q",
++    )
++    assert result.ret != 0
++    assert "invalid JSON" in result.stderr.str()
++
++
++def test_explain_deselections_update_baseline_malformed_existing_file_is_error(pytester):
++    pytester.makepyfile(
++        test_bl9="""
++        def test_a():
++            assert True
++        """
++    )
++    bad_baseline = pytester.path / "bad_update.json"
++    bad_baseline.write_text("not valid json {{{", encoding="utf-8")
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-baseline",
++        str(bad_baseline),
++        "--explain-deselections-update-baseline",
++        "-q",
++    )
++    assert result.ret != 0
++    assert "invalid JSON" in result.stderr.str()
++
++
++def test_explain_deselections_ini_enables_feature(pytester):
++    pytester.makeini("[pytest]\nexplain_deselections = true\n")
++    pytester.makepyfile(
++        test_ini1="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    result = pytester.runpytest("-q", "-k", "keep")
++    assert result.ret == 0
++    assert "deselected by -k keep: 1" in result.stdout.str()
++
++
++def test_explain_deselections_ini_min_count_applied(pytester):
++    pytester.makeini("[pytest]\nexplain_deselections = true\nexplain_deselections_min_count = 5\n")
++    pytester.makepyfile(
++        test_ini2="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    result = pytester.runpytest("-q", "-k", "keep")
++    assert result.ret == 0
++    assert "deselected by -k keep" not in result.stdout.str()
++    result2 = pytester.runpytest("-q", "-k", "keep", "--explain-deselections-min-count", "1")
++    assert "deselected by -k keep: 1" in result2.stdout.str()
++
++
++def test_explain_deselections_ini_format_csv(pytester):
++    out = pytester.path / "ini_fmt.csv"
++    pytester.makeini(
++        "[pytest]\nexplain_deselections = true\nexplain_deselections_format = csv\n"
++    )
++    pytester.makepyfile(
++        test_ini3="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    result = pytester.runpytest(
++        "--explain-deselections-output", str(out), "-q", "-k", "keep"
++    )
++    assert result.ret == 0
++    text = out.read_text(encoding="utf-8")
++    assert text.splitlines()[0] == "reason,count"
++    assert "-k keep" in text
++
++
++def test_explain_deselections_ini_fail_if_exceeds(pytester):
++    pytester.makeini(
++        "[pytest]\nexplain_deselections = true\nexplain_deselections_fail_if_exceeds = 0\n"
++    )
++    pytester.makepyfile(
++        test_ini4="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    result = pytester.runpytest("-q", "-k", "keep")
++    assert result.ret != 0
++    assert "DESELECTION THRESHOLD EXCEEDED" in result.stdout.str()
++
++
++def test_explain_deselections_ini_max_nodeids(pytester):
++    out = pytester.path / "ini_max.json"
++    pytester.makeini(
++        "[pytest]\nexplain_deselections = true\nexplain_deselections_format = json\nexplain_deselections_max_nodeids = 1\n"
++    )
++    pytester.makepyfile(
++        test_ini5="""
++        def test_keep():
++            assert True
++
++        def test_drop_1():
++            assert True
++
++        def test_drop_2():
++            assert True
++        """
++    )
++    result = pytester.runpytest(
++        "--explain-deselections-output", str(out), "-q", "-k", "keep"
++    )
++    assert result.ret == 0
++    data = json.loads(out.read_text(encoding="utf-8"))
++    assert len(data["reasons"][0]["nodeids"]) == 1
++
++
++def test_explain_deselections_ini_nodeids_order_sorted(pytester):
++    out = pytester.path / "ini_ord.json"
++    pytester.makeini(
++        "[pytest]\nexplain_deselections = true\nexplain_deselections_format = json\nexplain_deselections_max_nodeids = 3\nexplain_deselections_nodeids_order = sorted\n"
++    )
++    pytester.makepyfile(
++        test_ini6="""
++        def test_keep():
++            assert True
++
++        def test_drop_c():
++            assert True
++
++        def test_drop_a():
++            assert True
++
++        def test_drop_b():
++            assert True
++        """
++    )
++    result = pytester.runpytest(
++        "--explain-deselections-output", str(out), "-q", "-k", "keep"
++    )
++    assert result.ret == 0
++    data = json.loads(out.read_text(encoding="utf-8"))
++    nodeids = data["reasons"][0]["nodeids"]
++    assert nodeids == sorted(nodeids)
++
++
++def test_explain_deselections_ini_junit_properties(pytester):
++    xmlpath = pytester.path / "ini_junit.xml"
++    pytester.makeini(
++        "[pytest]\nexplain_deselections = true\nexplain_deselections_junit = properties\n"
++    )
++    pytester.makepyfile(
++        test_ini7="""
++        def test_keep():
++            assert True
++
++        def test_drop():
++            assert True
++        """
++    )
++    result = pytester.runpytest(
++        "--junitxml", str(xmlpath), "-q", "-k", "keep"
++    )
++    assert result.ret == 0
++    root = ET.fromstring(xmlpath.read_text(encoding="utf-8"))
++    suite = root.find("testsuite")
++    if suite is None:
++        suite = root.find("./testsuite")
++    if suite is None:
++        suite = root.find("./testsuites/testsuite")
++    assert suite is not None
++    props = suite.find("properties")
++    assert props is not None
++    props_list = props.findall("property")
++    names = {p.attrib.get("name", "") for p in props_list}
++    values_by_name = {p.attrib.get("name", ""): p.attrib.get("value", "") for p in props_list}
++    assert "pytest.deselections.total" in names
++    assert values_by_name["pytest.deselections.total"].isdigit()
++    assert all(n.startswith("pytest.deselections.") for n in names)
++
++
++def test_explain_deselections_ini_format_md_is_usage_error(pytester):
++    out = pytester.path / "ini_md.txt"
++    pytester.makeini(
++        "[pytest]\nexplain_deselections_format = md\n"
++    )
++    pytester.makepyfile(
++        test_inimd="""
++        def test_a():
++            assert True
++        """
++    )
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out),
++        "-q",
++    )
++    assert result.ret != 0
++    _assert_choose_from(result.stderr.str(), "text", "json", "csv")
++
++
++def test_explain_deselections_ini_format_csv_requires_output(pytester):
++    pytester.makeini(
++        "[pytest]\nexplain_deselections_format = csv\n"
++    )
++    pytester.makepyfile(
++        test_inicsv="""
++        def test_a():
++            assert True
++        """
++    )
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "-q",
++    )
++    assert result.ret != 0
++    assert "requires --explain-deselections-output" in result.stderr.str()
++
++
++def test_explain_deselections_ini_only_format_md_is_usage_error(pytester):
++    pytester.makeini(
++        "[pytest]\nexplain_deselections = true\nexplain_deselections_format = md\n"
++    )
++    pytester.makepyfile(
++        test_iniomd="""
++        def test_a():
++            assert True
++        """
++    )
++    result = pytester.runpytest("-q")
++    assert result.ret != 0
++    _assert_choose_from(result.stderr.str(), "text", "json", "csv")
++
++
++def test_explain_deselections_ini_only_format_csv_requires_output(pytester):
++    pytester.makeini(
++        "[pytest]\nexplain_deselections = true\nexplain_deselections_format = csv\n"
++    )
++    pytester.makepyfile(
++        test_iniocsv="""
++        def test_a():
++            assert True
++        """
++    )
++    result = pytester.runpytest("-q")
++    assert result.ret != 0
++    assert "requires --explain-deselections-output" in result.stderr.str()
++
++
++def test_explain_deselections_verbose_shows_nodeids(pytester):
++    pytester.makepyfile(
++        test_vb1="""
++        def test_keep(): pass
++        def test_alpha(): pass
++        def test_beta(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-verbose",
++        "--explain-deselections-max-nodeids",
++        "10",
++    )
++    out = result.stdout.str()
++    assert "::test_alpha" in out
++    assert "::test_beta" in out
++
++
++def test_explain_deselections_verbose_truncation_indicator(pytester):
++    pytester.makepyfile(
++        test_vb2="""
++        def test_keep(): pass
++        def test_a1(): pass
++        def test_a2(): pass
++        def test_a3(): pass
++        def test_a4(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-verbose",
++        "--explain-deselections-max-nodeids",
++        "2",
++    )
++    out = result.stdout.str()
++    assert "(+2 more)" in out
++
++
++def test_explain_deselections_whitespace_nodeid_recorded_verbatim(pytester):
++    pytester.makepyfile(
++        test_ws="""
++        import pytest
++
++        @pytest.mark.parametrize("x", ["a b", "c d"])
++        def test_drop(x):
++            assert True
++
++        def test_keep():
++            assert True
++        """
++    )
++    out = pytester.path / "ws.json"
++    result = pytester.runpytest(
++        "--explain-deselections",
++        "--explain-deselections-format",
++        "json",
++        "--explain-deselections-output",
++        str(out),
++        "--explain-deselections-max-nodeids",
++        "1",
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    data = json.loads(out.read_text(encoding="utf-8"))
++    reason = data["reasons"][0]
++    assert reason["count"] == 2
++    assert reason["nodeids"] == ["test_ws.py::test_drop[a b]"]
++
++    result_verbose = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-verbose",
++        "--explain-deselections-max-nodeids",
++        "1",
++    )
++    verbose_out = result_verbose.stdout.str()
++    assert "test_ws.py::test_drop[a b]" in verbose_out
++    assert "(+1 more)" in verbose_out
++
++
++def test_explain_deselections_verbose_without_max_nodeids_lists_none(pytester):
++    pytester.makepyfile(
++        test_vbnomax="""
++        def test_keep(): pass
++        def test_a(): pass
++        def test_b(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-verbose",
++    )
++    out = result.stdout.str()
++    assert "deselected by -k keep: 2" in out
++    assert "::test_a" not in out
++    assert "::test_b" not in out
++    assert "more)" not in out
++
++
++def test_explain_deselections_sort_by_count_descending(pytester):
++    pytester.makepyfile(
++        test_cnt="""
++        def test_x1(): pass
++        def test_x2(): pass
++        def test_x3(): pass
++        def test_keep(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "--deselect",
++        "test_cnt.py::test_x1",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-sort-by",
++        "count",
++    )
++    out = result.stdout.str()
++    k_idx = out.find("-k keep")
++    deselect_idx = out.find("--deselect")
++    assert k_idx != -1 and deselect_idx != -1
++    assert k_idx < deselect_idx
++
++
++def test_explain_deselections_sort_by_count_tie_breaks_on_reason(pytester):
++    pytester.makepyfile(
++        test_tie="""
++        def test_b(): pass
++        def test_a(): pass
++        def test_keep(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "--deselect",
++        "test_tie.py::test_b",
++        "--deselect",
++        "test_tie.py::test_a",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-sort-by",
++        "count",
++    )
++    out = result.stdout.str()
++    idx_a = out.find("--deselect test_tie.py::test_a")
++    idx_b = out.find("--deselect test_tie.py::test_b")
++    assert idx_a != -1 and idx_b != -1
++    assert idx_a < idx_b
++
++
++def test_explain_deselections_sort_by_delta_tie_breaks_on_reason(pytester):
++    pytester.makepyfile(
++        test_dtie="""
++        def test_b(): pass
++        def test_a(): pass
++        def test_keep(): pass
++        """
++    )
++    baseline = {
++        "schema_version": 1,
++        "total_deselected": 2,
++        "reasons": [
++            {"reason": "--deselect test_dtie.py::test_b", "count": 1, "nodeids": []},
++            {"reason": "--deselect test_dtie.py::test_a", "count": 1, "nodeids": []},
++        ],
++    }
++    baseline_file = pytester.path / "baseline.json"
++    baseline_file.write_text(json.dumps(baseline), encoding="utf-8")
++    result = pytester.runpytest(
++        "-q",
++        "--deselect",
++        "test_dtie.py::test_b",
++        "--deselect",
++        "test_dtie.py::test_a",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-baseline",
++        str(baseline_file),
++        "--explain-deselections-sort-by",
++        "delta",
++    )
++    out = result.stdout.str()
++    idx_a = out.find("--deselect test_dtie.py::test_a")
++    idx_b = out.find("--deselect test_dtie.py::test_b")
++    assert idx_a != -1 and idx_b != -1
++    assert idx_a < idx_b
++
++
++def test_explain_deselections_sort_by_reason_alphabetical(pytester):
++    pytester.makepyfile(
++        test_alph="""
++        def test_x1(): pass
++        def test_x2(): pass
++        def test_keep(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "--deselect",
++        "test_alph.py::test_x1",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-sort-by",
++        "reason",
++    )
++    out = result.stdout.str()
++    deselect_idx = out.find("--deselect")
++    k_idx = out.find("-k keep")
++    assert deselect_idx != -1 and k_idx != -1
++    assert deselect_idx < k_idx
++
++
++def test_explain_deselections_sort_by_delta_with_baseline(pytester):
++    pytester.makepyfile(
++        test_dlt="""
++        def test_x1(): pass
++        def test_x2(): pass
++        def test_x3(): pass
++        def test_keep(): pass
++        """
++    )
++    baseline = {
++        "schema_version": 1,
++        "total_deselected": 2,
++        "reasons": [
++            {"reason": "--deselect test_dlt.py::test_x1", "count": 1, "nodeids": []},
++            {"reason": "-k keep", "count": 1, "nodeids": []},
++        ],
++    }
++    baseline_file = pytester.path / "baseline.json"
++    baseline_file.write_text(json.dumps(baseline), encoding="utf-8")
++    result = pytester.runpytest(
++        "-q",
++        "--deselect",
++        "test_dlt.py::test_x1",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-baseline",
++        str(baseline_file),
++        "--explain-deselections-sort-by",
++        "delta",
++    )
++    out = result.stdout.str()
++    k_idx = out.find("-k keep")
++    deselect_idx = out.find("--deselect")
++    assert k_idx != -1 and deselect_idx != -1
++    assert k_idx < deselect_idx
++
++
++def test_explain_deselections_fail_on_new_exits_nonzero(pytester):
++    pytester.makepyfile(
++        test_fn1="""
++        def test_keep(): pass
++        def test_other(): pass
++        """
++    )
++    baseline = {"schema_version": 1, "total_deselected": 0, "reasons": []}
++    baseline_file = pytester.path / "baseline.json"
++    baseline_file.write_text(json.dumps(baseline), encoding="utf-8")
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-baseline",
++        str(baseline_file),
++        "--explain-deselections-fail-on-new",
++    )
++    assert result.ret != 0
++    assert "NEW DESELECTION REASONS" in result.stdout.str()
++
++
++def test_explain_deselections_fail_on_new_passes_when_same_reasons(pytester):
++    pytester.makepyfile(
++        test_fn2="""
++        def test_keep(): pass
++        def test_other(): pass
++        """
++    )
++    baseline = {
++        "schema_version": 1,
++        "total_deselected": 1,
++        "reasons": [{"reason": "-k keep", "count": 1, "nodeids": []}],
++    }
++    baseline_file = pytester.path / "baseline.json"
++    baseline_file.write_text(json.dumps(baseline), encoding="utf-8")
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-baseline",
++        str(baseline_file),
++        "--explain-deselections-fail-on-new",
++    )
++    assert result.ret == 0
++
++
++def test_explain_deselections_fail_on_new_requires_baseline(pytester):
++    pytester.makepyfile(
++        test_fn3="""
++        def test_a(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "--explain-deselections",
++        "--explain-deselections-fail-on-new",
++    )
++    assert result.ret != 0
++    assert "requires --explain-deselections-baseline" in result.stderr.str()
++
++
++def test_explain_deselections_update_baseline_writes_file(pytester):
++    pytester.makepyfile(
++        test_ub1="""
++        def test_keep(): pass
++        def test_other(): pass
++        """
++    )
++    old_baseline = {"schema_version": 1, "total_deselected": 0, "reasons": []}
++    baseline_file = pytester.path / "baseline.json"
++    baseline_file.write_text(json.dumps(old_baseline), encoding="utf-8")
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-baseline",
++        str(baseline_file),
++        "--explain-deselections-update-baseline",
++    )
++    assert result.ret == 0
++    data = json.loads(baseline_file.read_text(encoding="utf-8"))
++    assert data["total_deselected"] == 1
++    reasons = {r["reason"]: r["count"] for r in data["reasons"]}
++    assert "-k keep" in reasons
++
++
++def test_explain_deselections_update_baseline_creates_if_not_exists(pytester):
++    pytester.makepyfile(
++        test_ub2="""
++        def test_keep(): pass
++        def test_other(): pass
++        """
++    )
++    baseline_file = pytester.path / "new_baseline.json"
++    assert not baseline_file.exists()
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-baseline",
++        str(baseline_file),
++        "--explain-deselections-update-baseline",
++    )
++    assert result.ret == 0
++    assert "file not found" not in result.stderr.str()
++    assert baseline_file.exists()
++    data = json.loads(baseline_file.read_text(encoding="utf-8"))
++    assert data["total_deselected"] == 1
++
++
++def test_explain_deselections_update_baseline_requires_baseline(pytester):
++    pytester.makepyfile(
++        test_ub3="""
++        def test_a(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "--explain-deselections",
++        "--explain-deselections-update-baseline",
++    )
++    assert result.ret != 0
++    assert "requires --explain-deselections-baseline" in result.stderr.str()
++
++
++def test_explain_deselections_format_inferred_from_json_extension(pytester):
++    pytester.makepyfile(
++        test_inf1="""
++        def test_keep(): pass
++        def test_other(): pass
++        """
++    )
++    out_file = pytester.path / "report.json"
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out_file),
++    )
++    assert result.ret == 0
++    assert out_file.exists()
++    data = json.loads(out_file.read_text(encoding="utf-8"))
++    assert "total_deselected" in data
++
++
++def test_explain_deselections_format_inferred_from_csv_extension(pytester):
++    pytester.makepyfile(
++        test_inf2="""
++        def test_keep(): pass
++        def test_other(): pass
++        """
++    )
++    out_file = pytester.path / "report.csv"
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out_file),
++    )
++    assert result.ret == 0
++    assert out_file.exists()
++    content = out_file.read_text(encoding="utf-8")
++    assert content.startswith("reason,count")
++
++
++def test_explain_deselections_explicit_format_overrides_extension(pytester):
++    pytester.makepyfile(
++        test_inf3="""
++        def test_keep(): pass
++        def test_other(): pass
++        """
++    )
++    out_file = pytester.path / "report.json"
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out_file) + ":text",
++    )
++    assert result.ret == 0
++    assert out_file.exists()
++    content = out_file.read_text(encoding="utf-8")
++    try:
++        json.loads(content)
++        is_json = True
++    except Exception:
++        is_json = False
++    assert not is_json
++
++
++def test_explain_deselections_sort_by_invalid_choice(pytester):
++    pytester.makepyfile(
++        test_sbi="""
++        def test_a(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "--explain-deselections",
++        "--explain-deselections-sort-by",
++        "invalid",
++    )
++    assert result.ret != 0
++    assert "choose from" in result.stderr.str()
++
++
++def test_explain_deselections_warn_if_exceeds_prints_warning(pytester):
++    pytester.makepyfile(
++        test_w1="""
++        def test_keep(): pass
++        def test_a(): pass
++        def test_b(): pass
++        def test_c(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-warn-if-exceeds",
++        "1",
++    )
++    assert result.ret == 0
++    out = result.stdout.str()
++    assert "DESELECTION WARNING: 3 tests deselected (warning threshold: 1)" in out
++
++
++def test_explain_deselections_warn_if_exceeds_no_warning_when_under(pytester):
++    pytester.makepyfile(
++        test_w2="""
++        def test_keep(): pass
++        def test_other(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-warn-if-exceeds",
++        "5",
++    )
++    assert result.ret == 0
++    assert "DESELECTION WARNING" not in result.stdout.str()
++
++
++def test_explain_deselections_warn_if_exceeds_not_triggered_when_equal(pytester):
++    pytester.makepyfile(
++        test_weeq="""
++        def test_keep(): pass
++        def test_drop_1(): pass
++        def test_drop_2(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-warn-if-exceeds",
++        "2",
++    )
++    assert result.ret == 0
++    assert "DESELECTION WARNING" not in result.stdout.str()
++
++
++def test_explain_deselections_warn_if_exceeds_zero_warns_on_any(pytester):
++    pytester.makepyfile(
++        test_w3="""
++        def test_keep(): pass
++        def test_other(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-warn-if-exceeds",
++        "0",
++    )
++    assert result.ret == 0
++    assert "DESELECTION WARNING" in result.stdout.str()
++
++
++def test_explain_deselections_warn_if_exceeds_does_not_fail(pytester):
++    pytester.makepyfile(
++        test_w4="""
++        def test_keep(): pass
++        def test_a(): pass
++        def test_b(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-warn-if-exceeds",
++        "0",
++    )
++    assert result.ret == 0
++
++
++def test_explain_deselections_warn_if_exceeds_negative_invalid(pytester):
++    pytester.makepyfile(
++        test_w5="""
++        def test_a(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "--explain-deselections",
++        "--explain-deselections-warn-if-exceeds",
++        "-1",
++    )
++    assert result.ret != 0
++    assert "must be >= 0" in result.stderr.str()
++
++
++def test_explain_deselections_show_total_line(pytester):
++    pytester.makepyfile(
++        test_st1="""
++        def test_keep(): pass
++        def test_a(): pass
++        def test_b(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-show-total",
++    )
++    assert result.ret == 0
++    assert "Total deselected: 2" in result.stdout.str()
++
++
++def test_explain_deselections_show_total_zero_deselections(pytester):
++    pytester.makepyfile(
++        test_st2="""
++        def test_a(): pass
++        def test_b(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "--explain-deselections",
++        "--explain-deselections-show-total",
++    )
++    assert result.ret == 0
++    assert "Total deselected: 0" in result.stdout.str()
++
++
++def test_explain_deselections_reason_filter_matches(pytester):
++    pytester.makepyfile(
++        test_rf1="""
++        def test_keep(): pass
++        def test_a(): pass
++        def test_b(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--deselect",
++        "test_rf1.py::test_a",
++        "--explain-deselections",
++        "--explain-deselections-reason-filter",
++        r"deselect",
++    )
++    out = result.stdout.str()
++    assert "--deselect" in out
++    assert "-k keep" not in out
++
++
++def test_explain_deselections_reason_filter_excludes_all(pytester):
++    pytester.makepyfile(
++        test_rf2="""
++        def test_keep(): pass
++        def test_a(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-reason-filter",
++        r"^NOMATCH$",
++    )
++    assert result.ret == 0
++    out = result.stdout.str()
++    assert "deselected by" not in out
++
++
++def test_explain_deselections_reason_filter_empty_shows_all(pytester):
++    pytester.makepyfile(
++        test_rf3="""
++        def test_keep(): pass
++        def test_a(): pass
++        def test_b(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "--deselect",
++        "test_rf3.py::test_a",
++        "-k",
++        "keep",
++        "--explain-deselections",
++    )
++    out = result.stdout.str()
++    assert "--deselect" in out
++    assert "-k keep" in out
++
++
++def test_explain_deselections_reason_filter_invalid_regex(pytester):
++    pytester.makepyfile(
++        test_rf4="""
++        def test_a(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "--explain-deselections",
++        "--explain-deselections-reason-filter",
++        "[invalid",
++    )
++    assert result.ret != 0
++    assert "invalid regex" in result.stderr.str()
++
++
++def test_explain_deselections_markdown_output_contains_header(pytester):
++    pytester.makepyfile(
++        test_md1="""
++        def test_keep(): pass
++        def test_other(): pass
++        """
++    )
++    out_file = pytester.path / "report.md"
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out_file),
++    )
++    assert result.ret == 0
++    assert out_file.exists()
++    content = out_file.read_text(encoding="utf-8")
++    assert "# Deselection Report" in content
++
++
++def test_explain_deselections_markdown_table_has_reason(pytester):
++    pytester.makepyfile(
++        test_md2="""
++        def test_keep(): pass
++        def test_other(): pass
++        """
++    )
++    out_file = pytester.path / "report.md"
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out_file),
++    )
++    assert result.ret == 0
++    content = out_file.read_text(encoding="utf-8")
++    assert "-k keep" in content
++    assert "Reason" in content
++    assert "Count" in content
++
++
++def test_explain_deselections_markdown_renders_reason_with_ampersand(pytester):
++    group_dir = pytester.path / "grp&amp"
++    group_dir.mkdir()
++    (group_dir / "test_x.py").write_text("def test_a():\n    pass\n", encoding="utf-8")
++    out_file = pytester.path / "amp.md"
++    result = pytester.runpytest(
++        "--import-mode=importlib",
++        "-q",
++        "--deselect",
++        "grp&amp/test_x.py::test_a",
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out_file),
++    )
++    assert result.ret in (0, 5)
++    content = out_file.read_text(encoding="utf-8")
++    assert (
++        "--deselect grp&amp/test_x.py::test_a" in content
++        or "--deselect grp&amp;amp/test_x.py::test_a" in content
++    )
++
++
++def test_explain_deselections_markdown_with_baseline_has_delta_column(pytester):
++    pytester.makepyfile(
++        test_md3="""
++        def test_keep(): pass
++        def test_other(): pass
++        """
++    )
++    baseline = {
++        "schema_version": 1,
++        "total_deselected": 1,
++        "reasons": [{"reason": "-k keep", "count": 1, "nodeids": []}],
++    }
++    baseline_file = pytester.path / "baseline.json"
++    baseline_file.write_text(json.dumps(baseline), encoding="utf-8")
++    out_file = pytester.path / "report.md"
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-baseline",
++        str(baseline_file),
++        "--explain-deselections-output",
++        str(out_file),
++    )
++    assert result.ret == 0
++    content = out_file.read_text(encoding="utf-8")
++    assert "Reason" in content
++    assert "Count" in content
++    assert "Baseline" in content
++    assert "Delta" in content
++
++
++def test_explain_deselections_markdown_explicit_format(pytester):
++    pytester.makepyfile(
++        test_md4="""
++        def test_keep(): pass
++        def test_other(): pass
++        """
++    )
++    out_file = pytester.path / "report.txt"
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out_file) + ":md",
++    )
++    assert result.ret == 0
++    content = out_file.read_text(encoding="utf-8")
++    assert "# Deselection Report" in content
++
++
++def test_explain_deselections_markdown_explicit_format_token(pytester):
++    pytester.makepyfile(
++        test_md_tok="""
++        def test_keep(): pass
++        def test_other(): pass
++        """
++    )
++    out_file = pytester.path / "report.txt"
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out_file) + ":markdown",
++    )
++    assert result.ret == 0
++    content = out_file.read_text(encoding="utf-8")
++    assert "# Deselection Report" in content
++
++
++def test_explain_deselections_markdown_extension_inferred(pytester):
++    pytester.makepyfile(
++        test_md_ext="""
++        def test_keep(): pass
++        def test_other(): pass
++        """
++    )
++    out_file = pytester.path / "report.markdown"
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out_file),
++    )
++    assert result.ret == 0
++    content = out_file.read_text(encoding="utf-8")
++    assert "# Deselection Report" in content
++
++
++def test_explain_deselections_markdown_total_deselected_shown(pytester):
++    pytester.makepyfile(
++        test_md5="""
++        def test_keep(): pass
++        def test_a(): pass
++        def test_b(): pass
++        """
++    )
++    out_file = pytester.path / "report.md"
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out_file),
++    )
++    assert result.ret == 0
++    content = out_file.read_text(encoding="utf-8")
++    assert "**Total deselected:** 2" in content
++
++
++def test_explain_deselections_html_output_is_valid_html(pytester):
++    pytester.makepyfile(
++        test_html1="""
++        def test_keep(): pass
++        def test_other(): pass
++        """
++    )
++    out_file = pytester.path / "report.html"
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out_file),
++    )
++    assert result.ret == 0
++    assert out_file.exists()
++    content = out_file.read_text(encoding="utf-8")
++    assert "<!DOCTYPE html>" in content
++    assert "<table>" in content
++
++
++def test_explain_deselections_html_contains_reason(pytester):
++    pytester.makepyfile(
++        test_html2="""
++        def test_keep(): pass
++        def test_other(): pass
++        """
++    )
++    out_file = pytester.path / "report.html"
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out_file),
++    )
++    assert result.ret == 0
++    content = out_file.read_text(encoding="utf-8")
++    assert "-k keep" in content
++
++
++def test_explain_deselections_html_total_deselected_shown(pytester):
++    pytester.makepyfile(
++        test_html5="""
++        def test_keep(): pass
++        def test_a(): pass
++        def test_b(): pass
++        """
++    )
++    out_file = pytester.path / "report.html"
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out_file),
++    )
++    assert result.ret == 0
++    content = out_file.read_text(encoding="utf-8")
++    text = re.sub(r"<[^>]+>", "", content)
++    assert "Total deselected: 2" in text
++
++
++def test_explain_deselections_html_escapes_ampersand_in_reason(pytester):
++    group_dir = pytester.path / "grp&amp"
++    group_dir.mkdir()
++    (group_dir / "test_x.py").write_text("def test_a():\n    pass\n", encoding="utf-8")
++    out_file = pytester.path / "amp.html"
++    result = pytester.runpytest(
++        "--import-mode=importlib",
++        "-q",
++        "--deselect",
++        "grp&amp/test_x.py::test_a",
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out_file),
++    )
++    assert result.ret in (0, 5)
++    content = out_file.read_text(encoding="utf-8")
++    assert "grp&amp;amp/test_x.py::test_a" in content
++    assert "grp&amp/test_x.py::test_a" not in content
++
++
++def test_explain_deselections_html_explicit_format_overrides_extension(pytester):
++    pytester.makepyfile(
++        test_html3="""
++        def test_keep(): pass
++        def test_other(): pass
++        """
++    )
++    out_file = pytester.path / "report.html"
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out_file) + ":text",
++    )
++    assert result.ret == 0
++    content = out_file.read_text(encoding="utf-8")
++    assert "<!DOCTYPE html>" not in content
++    assert "deselected by" in content
++
++
++def test_explain_deselections_html_with_baseline_has_delta(pytester):
++    pytester.makepyfile(
++        test_html4="""
++        def test_keep(): pass
++        def test_other(): pass
++        """
++    )
++    baseline = {
++        "schema_version": 1,
++        "total_deselected": 1,
++        "reasons": [{"reason": "-k keep", "count": 1, "nodeids": []}],
++    }
++    baseline_file = pytester.path / "baseline.json"
++    baseline_file.write_text(json.dumps(baseline), encoding="utf-8")
++    out_file = pytester.path / "report.html"
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-baseline",
++        str(baseline_file),
++        "--explain-deselections-output",
++        str(out_file),
++    )
++    assert result.ret == 0
++    content = out_file.read_text(encoding="utf-8")
++    assert "Baseline" in content
++    assert "Delta" in content
++
++
++def test_explain_deselections_json_no_nodeids_excludes_array(pytester):
++    pytester.makepyfile(
++        test_jni1="""
++        def test_keep(): pass
++        def test_a(): pass
++        """
++    )
++    out_file = pytester.path / "report.json"
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out_file),
++        "--explain-deselections-max-nodeids",
++        "10",
++        "--explain-deselections-json-no-nodeids",
++    )
++    assert result.ret == 0
++    data = json.loads(out_file.read_text(encoding="utf-8"))
++    for r in data["reasons"]:
++        assert "nodeids" not in r
++
++
++def test_explain_deselections_json_nodeids_present_by_default(pytester):
++    pytester.makepyfile(
++        test_jni2="""
++        def test_keep(): pass
++        def test_a(): pass
++        """
++    )
++    out_file = pytester.path / "report.json"
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out_file),
++    )
++    assert result.ret == 0
++    data = json.loads(out_file.read_text(encoding="utf-8"))
++    for r in data["reasons"]:
++        assert "nodeids" in r
++
++
++def test_explain_deselections_csv_with_delta_adds_columns(pytester):
++    pytester.makepyfile(
++        test_cwd1="""
++        def test_keep(): pass
++        def test_a(): pass
++        """
++    )
++    baseline = {
++        "schema_version": 1,
++        "total_deselected": 1,
++        "reasons": [{"reason": "-k keep", "count": 1, "nodeids": []}],
++    }
++    baseline_file = pytester.path / "baseline.json"
++    baseline_file.write_text(json.dumps(baseline), encoding="utf-8")
++    out_file = pytester.path / "report.csv"
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-baseline",
++        str(baseline_file),
++        "--explain-deselections-output",
++        str(out_file),
++        "--explain-deselections-csv-with-delta",
++    )
++    assert result.ret == 0
++    content = out_file.read_text(encoding="utf-8")
++    assert content.startswith("reason,count,baseline_count,delta")
++
++
++def test_explain_deselections_csv_with_delta_row_values(pytester):
++    pytester.makepyfile(
++        test_cwdrow="""
++        def test_keep(): pass
++        def test_a(): pass
++        def test_b(): pass
++        """
++    )
++    baseline = {
++        "schema_version": 1,
++        "total_deselected": 1,
++        "reasons": [{"reason": "-k keep", "count": 1, "nodeids": []}],
++    }
++    baseline_file = pytester.path / "baseline.json"
++    baseline_file.write_text(json.dumps(baseline), encoding="utf-8")
++    out_file = pytester.path / "row.csv"
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-baseline",
++        str(baseline_file),
++        "--explain-deselections-output",
++        str(out_file),
++        "--explain-deselections-csv-with-delta",
++    )
++    assert result.ret == 0
++    lines = [l for l in out_file.read_text(encoding="utf-8").splitlines() if l]
++    assert lines[0] == "reason,count,baseline_count,delta"
++    assert lines[1] in ("-k keep,2,1,1", "-k keep,2,1,+1")
++
++
++def test_explain_deselections_csv_without_delta_has_two_columns(pytester):
++    pytester.makepyfile(
++        test_cwd2="""
++        def test_keep(): pass
++        def test_a(): pass
++        """
++    )
++    baseline = {
++        "schema_version": 1,
++        "total_deselected": 0,
++        "reasons": [],
++    }
++    baseline_file = pytester.path / "baseline.json"
++    baseline_file.write_text(json.dumps(baseline), encoding="utf-8")
++    out_file = pytester.path / "report.csv"
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-baseline",
++        str(baseline_file),
++        "--explain-deselections-output",
++        str(out_file),
++    )
++    assert result.ret == 0
++    content = out_file.read_text(encoding="utf-8")
++    assert content.startswith("reason,count")
++    assert "baseline_count" not in content
++
++
++def test_explain_deselections_min_delta_filters_unchanged(pytester):
++    pytester.makepyfile(
++        test_mndlt="""
++        def test_keep(): pass
++        def test_x1(): pass
++        def test_x2(): pass
++        """
++    )
++    baseline = {
++        "schema_version": 1,
++        "total_deselected": 2,
++        "reasons": [
++            {"reason": "-k keep", "count": 2, "nodeids": []},
++        ],
++    }
++    baseline_file = pytester.path / "baseline.json"
++    baseline_file.write_text(json.dumps(baseline), encoding="utf-8")
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-baseline",
++        str(baseline_file),
++        "--explain-deselections-min-delta",
++        "2",
++    )
++    assert result.ret == 0
++    out = result.stdout.str()
++    assert "deselected by" not in out
++
++
++def test_explain_deselections_min_delta_shows_changed(pytester):
++    pytester.makepyfile(
++        test_mndlt2="""
++        def test_keep(): pass
++        def test_a(): pass
++        def test_b(): pass
++        def test_c(): pass
++        """
++    )
++    baseline = {
++        "schema_version": 1,
++        "total_deselected": 1,
++        "reasons": [
++            {"reason": "-k keep", "count": 1, "nodeids": []},
++        ],
++    }
++    baseline_file = pytester.path / "baseline.json"
++    baseline_file.write_text(json.dumps(baseline), encoding="utf-8")
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-baseline",
++        str(baseline_file),
++        "--explain-deselections-min-delta",
++        "2",
++    )
++    out = result.stdout.str()
++    assert "deselected by -k keep" in out
++
++
++def test_explain_deselections_min_delta_negative_invalid(pytester):
++    pytester.makepyfile(
++        test_mndlt3="""
++        def test_a(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "--explain-deselections",
++        "--explain-deselections-min-delta",
++        "-1",
++    )
++    assert result.ret != 0
++    assert "must be >= 0" in result.stderr.str()
++
++
++def test_explain_deselections_min_delta_requires_baseline(pytester):
++    pytester.makepyfile(
++        test_mndlt4="""
++        def test_a(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "--explain-deselections",
++        "--explain-deselections-min-delta",
++        "1",
++    )
++    assert result.ret != 0
++    assert "requires --explain-deselections-baseline" in result.stderr.str()
++
++
++def test_explain_deselections_html_inferred_from_htm_extension(pytester):
++    pytester.makepyfile(
++        test_htmext="""
++        def test_keep(): pass
++        def test_other(): pass
++        """
++    )
++    out_file = pytester.path / "report.htm"
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out_file),
++    )
++    assert result.ret == 0
++    content = out_file.read_text(encoding="utf-8")
++    assert "<!DOCTYPE html>" in content
++
++
++def test_explain_deselections_markdown_no_deselections_message(pytester):
++    pytester.makepyfile(
++        test_mdnd="""
++        def test_a(): pass
++        def test_b(): pass
++        """
++    )
++    out_file = pytester.path / "report.md"
++    result = pytester.runpytest(
++        "-q",
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out_file),
++    )
++    assert result.ret == 0
++    content = out_file.read_text(encoding="utf-8")
++    assert "No deselections recorded." in content
++
++
++def test_explain_deselections_html_no_deselections_message(pytester):
++    pytester.makepyfile(
++        test_htmlnd="""
++        def test_a(): pass
++        def test_b(): pass
++        """
++    )
++    out_file = pytester.path / "report.html"
++    result = pytester.runpytest(
++        "-q",
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out_file),
++    )
++    assert result.ret == 0
++    content = out_file.read_text(encoding="utf-8")
++    assert "No deselections recorded." in content
++
++
++def test_explain_deselections_reason_filter_with_sort_by(pytester):
++    pytester.makepyfile(
++        test_rfsort="""
++        def test_keep(): pass
++        def test_a(): pass
++        def test_b(): pass
++        def test_c(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "--deselect",
++        "test_rfsort.py::test_a",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-reason-filter",
++        r"deselect",
++        "--explain-deselections-sort-by",
++        "count",
++    )
++    out = result.stdout.str()
++    assert "--deselect" in out
++    assert "-k keep" not in out
++
++
++def test_explain_deselections_warn_and_fail_both_trigger(pytester):
++    pytester.makepyfile(
++        test_wf="""
++        def test_keep(): pass
++        def test_a(): pass
++        def test_b(): pass
++        def test_c(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-warn-if-exceeds",
++        "0",
++        "--explain-deselections-fail-if-exceeds",
++        "0",
++    )
++    assert result.ret != 0
++    out = result.stdout.str()
++    assert "DESELECTION WARNING" in out
++    assert "DESELECTION THRESHOLD EXCEEDED" in out
++
++
++def test_explain_deselections_show_total_with_baseline(pytester):
++    pytester.makepyfile(
++        test_stb="""
++        def test_keep(): pass
++        def test_a(): pass
++        """
++    )
++    baseline = {
++        "schema_version": 1,
++        "total_deselected": 0,
++        "reasons": [],
++    }
++    baseline_file = pytester.path / "baseline.json"
++    baseline_file.write_text(json.dumps(baseline), encoding="utf-8")
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-baseline",
++        str(baseline_file),
++        "--explain-deselections-show-total",
++    )
++    out = result.stdout.str()
++    assert "Total deselected: 1" in out
++
++
++def test_explain_deselections_markdown_verbose_nodeids_section(pytester):
++    pytester.makepyfile(
++        test_mdv="""
++        def test_keep(): pass
++        def test_other(): pass
++        """
++    )
++    out_file = pytester.path / "report.md"
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-verbose",
++        "--explain-deselections-max-nodeids",
++        "5",
++        "--explain-deselections-output",
++        str(out_file),
++    )
++    assert result.ret == 0
++    content = out_file.read_text(encoding="utf-8")
++    assert "## Node IDs" in content
++    assert "::test_other" in content
++
++
++def test_explain_deselections_html_verbose_shows_nodeids(pytester):
++    pytester.makepyfile(
++        test_htmlv="""
++        def test_keep(): pass
++        def test_other(): pass
++        """
++    )
++    out_file = pytester.path / "report.html"
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-verbose",
++        "--explain-deselections-max-nodeids",
++        "5",
++        "--explain-deselections-output",
++        str(out_file),
++    )
++    assert result.ret == 0
++    content = out_file.read_text(encoding="utf-8")
++    assert "::test_other" in content
++    assert "<ul>" in content
++
++
++def test_explain_deselections_show_stats_prints_block(pytester):
++    pytester.makepyfile(
++        test_ss1="""
++        def test_keep(): pass
++        def test_a(): pass
++        def test_b(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-show-stats",
++    )
++    out = result.stdout.str()
++    assert "Deselection statistics:" in out
++    assert "total deselected:" in out
++    assert "distinct reasons:" in out
++
++
++def test_explain_deselections_show_stats_includes_counts(pytester):
++    pytester.makepyfile(
++        test_ss2="""
++        def test_keep(): pass
++        def test_a(): pass
++        def test_b(): pass
++        def test_c(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-show-stats",
++    )
++    out = result.stdout.str()
++    assert "max per reason:" in out
++    assert "mean per reason:" in out
++
++
++def test_explain_deselections_show_stats_with_baseline(pytester):
++    pytester.makepyfile(
++        test_ss3="""
++        def test_keep(): pass
++        def test_a(): pass
++        """
++    )
++    baseline = {
++        "schema_version": 1,
++        "total_deselected": 0,
++        "reasons": [],
++    }
++    baseline_file = pytester.path / "baseline.json"
++    baseline_file.write_text(json.dumps(baseline), encoding="utf-8")
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-baseline",
++        str(baseline_file),
++        "--explain-deselections-show-stats",
++    )
++    out = result.stdout.str()
++    assert "new reasons:" in out
++    assert "total delta:" in out
++
++
++def test_explain_deselections_reasons_cap_limits_output(pytester):
++    pytester.makepyfile(
++        test_rc1="""
++        def test_a(): pass
++        def test_b(): pass
++        def test_c(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "--deselect",
++        "test_rc1.py::test_a",
++        "--deselect",
++        "test_rc1.py::test_b",
++        "--deselect",
++        "test_rc1.py::test_c",
++        "--explain-deselections",
++        "--explain-deselections-reasons-cap",
++        "1",
++    )
++    out = result.stdout.str()
++    assert out.count("deselected by") == 1
++
++
++def test_explain_deselections_reasons_cap_zero_shows_all(pytester):
++    pytester.makepyfile(
++        test_rc2="""
++        def test_a(): pass
++        def test_b(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "--deselect",
++        "test_rc2.py::test_a",
++        "--deselect",
++        "test_rc2.py::test_b",
++        "--explain-deselections",
++        "--explain-deselections-reasons-cap",
++        "0",
++    )
++    out = result.stdout.str()
++    assert out.count("deselected by") == 2
++
++
++def test_explain_deselections_reasons_cap_negative_invalid(pytester):
++    pytester.makepyfile(
++        test_rc3="""
++        def test_a(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "--explain-deselections",
++        "--explain-deselections-reasons-cap",
++        "-1",
++    )
++    assert result.ret != 0
++    assert "must be >= 0" in result.stderr.str()
++
++
++def test_explain_deselections_json_pretty_has_indentation(pytester):
++    pytester.makepyfile(
++        test_jp1="""
++        def test_keep(): pass
++        def test_other(): pass
++        """
++    )
++    out_file = pytester.path / "report.json"
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out_file),
++        "--explain-deselections-json-pretty",
++    )
++    assert result.ret == 0
++    content = out_file.read_text(encoding="utf-8")
++    assert "\n" in content.strip()
++
++
++def test_explain_deselections_json_compact_by_default(pytester):
++    pytester.makepyfile(
++        test_jp2="""
++        def test_keep(): pass
++        def test_other(): pass
++        """
++    )
++    out_file = pytester.path / "report.json"
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out_file),
++    )
++    assert result.ret == 0
++    content = out_file.read_text(encoding="utf-8")
++    data = json.loads(content)
++    assert "total_deselected" in data
++
++
++def test_explain_deselections_json_pretty_valid_json(pytester):
++    pytester.makepyfile(
++        test_jp3="""
++        def test_keep(): pass
++        def test_other(): pass
++        """
++    )
++    out_file = pytester.path / "report.json"
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out_file),
++        "--explain-deselections-json-pretty",
++    )
++    assert result.ret == 0
++    data = json.loads(out_file.read_text(encoding="utf-8"))
++    assert "total_deselected" in data
++    assert data["total_deselected"] == 1
++
++
++def test_explain_deselections_show_stats_zero_deselections(pytester):
++    pytester.makepyfile(
++        test_ss4="""
++        def test_a(): pass
++        def test_b(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "--explain-deselections",
++        "--explain-deselections-show-stats",
++    )
++    out = result.stdout.str()
++    assert "Deselection statistics:" in out
++    assert "total deselected: 0" in out
++    assert "max per reason:" not in out
++    assert "min per reason:" not in out
++    assert "mean per reason:" not in out
++    assert "median per reason:" not in out
++
++
++def test_explain_deselections_reasons_cap_in_json_output(pytester):
++    pytester.makepyfile(
++        test_rcj="""
++        def test_a(): pass
++        def test_b(): pass
++        def test_c(): pass
++        """
++    )
++    out_file = pytester.path / "report.json"
++    result = pytester.runpytest(
++        "-q",
++        "--deselect",
++        "test_rcj.py::test_a",
++        "--deselect",
++        "test_rcj.py::test_b",
++        "--deselect",
++        "test_rcj.py::test_c",
++        "--explain-deselections",
++        "--explain-deselections-output",
++        str(out_file),
++        "--explain-deselections-reasons-cap",
++        "2",
++    )
++    assert out_file.exists()
++    data = json.loads(out_file.read_text(encoding="utf-8"))
++    assert len(data["reasons"]) == 2
++
++
++def test_explain_deselections_show_stats_min_and_median(pytester):
++    pytester.makepyfile(
++        test_ssm="""
++        def test_keep(): pass
++        def test_a(): pass
++        def test_b(): pass
++        def test_c(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-show-stats",
++    )
++    out = result.stdout.str()
++    assert "min per reason:" in out
++    assert "median per reason:" in out
++
++
++def test_explain_deselections_show_stats_improved_worsened_unchanged(pytester):
++    pytester.makepyfile(
++        test_ssiw="""
++        def test_keep(): pass
++        def test_a(): pass
++        """
++    )
++    baseline = {
++        "schema_version": 1,
++        "total_deselected": 1,
++        "reasons": [{"reason": "-k keep", "count": 1, "nodeids": []}],
++    }
++    baseline_file = pytester.path / "baseline.json"
++    baseline_file.write_text(json.dumps(baseline), encoding="utf-8")
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-baseline",
++        str(baseline_file),
++        "--explain-deselections-show-stats",
++    )
++    out = result.stdout.str()
++    assert "improved reasons:" in out
++    assert "worsened reasons:" in out
++    assert "unchanged reasons:" in out
++
++
++def test_explain_deselections_show_stats_mixed_baseline_category_counts(pytester):
++    pytester.makepyfile(
++        test_ssmix="""
++        def test_new(): pass
++        def test_improved(): pass
++        class TestW:
++            def test_a(self): pass
++            def test_b(self): pass
++        def test_unchanged(): pass
++        def test_keep(): pass
++        """
++    )
++    baseline = {
++        "schema_version": 1,
++        "total_deselected": 4,
++        "reasons": [
++            {"reason": "--deselect test_ssmix.py::test_improved", "count": 2, "nodeids": []},
++            {"reason": "--deselect test_ssmix.py::TestW", "count": 1, "nodeids": []},
++            {"reason": "--deselect test_ssmix.py::test_unchanged", "count": 1, "nodeids": []},
++        ],
++    }
++    baseline_file = pytester.path / "baseline.json"
++    baseline_file.write_text(json.dumps(baseline), encoding="utf-8")
++    result = pytester.runpytest(
++        "-q",
++        "--deselect",
++        "test_ssmix.py::test_new",
++        "--deselect",
++        "test_ssmix.py::test_improved",
++        "--deselect",
++        "test_ssmix.py::TestW",
++        "--deselect",
++        "test_ssmix.py::test_unchanged",
++        "--explain-deselections",
++        "--explain-deselections-baseline",
++        str(baseline_file),
++        "--explain-deselections-show-stats",
++    )
++    out = result.stdout.str()
++    assert re.search(r"new reasons:\s*1", out)
++    assert re.search(r"improved reasons:\s*1", out)
++    assert re.search(r"worsened reasons:\s*1", out)
++    assert re.search(r"unchanged reasons:\s*1", out)
++
++
++def test_explain_deselections_junit_requires_junitxml(pytester):
++    pytester.makepyfile(
++        test_junitreq="""
++        def test_keep(): pass
++        def test_other(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-junit",
++        "properties",
++    )
++    assert result.ret != 0
++    assert "requires --junitxml" in result.stderr.str()
++
++
++def test_explain_deselections_multiple_sources_independent_counts(pytester):
++    pytester.makepyfile(
++        test_msic="""
++        import pytest
++        def test_keep(): pass
++        @pytest.mark.slow
++        def test_slow(): pass
++        def test_other(): pass
++        def test_another(): pass
++        """
++    )
++    out_file = pytester.path / "report.json"
++    result = pytester.runpytest(
++        "-q",
++        "-k", "keep or slow",
++        "-m", "not slow",
++        "--explain-deselections",
++        "--explain-deselections-output", str(out_file),
++    )
++    assert result.ret == 0
++    data = json.loads(out_file.read_text(encoding="utf-8"))
++    reason_map = {r["reason"]: r["count"] for r in data["reasons"]}
++    assert "-k keep or slow" in reason_map
++    assert "-m not slow" in reason_map
++    assert reason_map["-k keep or slow"] >= 1
++    assert reason_map["-m not slow"] >= 1
++
++
++def test_explain_deselections_markdown_verbose_truncation(pytester):
++    pytester.makepyfile(
++        test_mdvt="""
++        def test_keep(): pass
++        def test_a(): pass
++        def test_b(): pass
++        def test_c(): pass
++        def test_d(): pass
++        """
++    )
++    out_file = pytester.path / "report.md"
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-verbose",
++        "--explain-deselections-max-nodeids",
++        "2",
++        "--explain-deselections-output",
++        str(out_file),
++    )
++    assert result.ret == 0
++    content = out_file.read_text(encoding="utf-8")
++    assert "more)" in content
++
++
++def test_explain_deselections_html_verbose_truncation(pytester):
++    pytester.makepyfile(
++        test_htmlvt="""
++        def test_keep(): pass
++        def test_a(): pass
++        def test_b(): pass
++        def test_c(): pass
++        def test_d(): pass
++        """
++    )
++    out_file = pytester.path / "report.html"
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-verbose",
++        "--explain-deselections-max-nodeids",
++        "2",
++        "--explain-deselections-output",
++        str(out_file),
++    )
++    assert result.ret == 0
++    content = out_file.read_text(encoding="utf-8")
++    assert "more)" in content
++
++
++def test_explain_deselections_verbose_nodeids_order_sorted_outside_json(pytester):
++    pytester.makepyfile(
++        test_vno="""
++        def test_keep(): pass
++        def test_c(): pass
++        def test_a(): pass
++        def test_b(): pass
++        """
++    )
++    md_file = pytester.path / "report.md"
++    html_file = pytester.path / "report.html"
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-verbose",
++        "--explain-deselections-max-nodeids",
++        "3",
++        "--explain-deselections-nodeids-order",
++        "sorted",
++        "--explain-deselections-output",
++        str(md_file),
++        "--explain-deselections-output",
++        str(html_file),
++    )
++    assert result.ret == 0
++    terminal = result.stdout.str()
++    idx_a_t = terminal.find("::test_a")
++    idx_b_t = terminal.find("::test_b")
++    idx_c_t = terminal.find("::test_c")
++    assert idx_a_t != -1 and idx_b_t != -1 and idx_c_t != -1
++    assert idx_a_t < idx_b_t < idx_c_t
++
++    md_content = md_file.read_text(encoding="utf-8")
++    idx_a_md = md_content.find("::test_a")
++    idx_b_md = md_content.find("::test_b")
++    idx_c_md = md_content.find("::test_c")
++    assert idx_a_md != -1 and idx_b_md != -1 and idx_c_md != -1
++    assert idx_a_md < idx_b_md < idx_c_md
++
++    html_content = html_file.read_text(encoding="utf-8")
++    idx_a_h = html_content.find("::test_a")
++    idx_b_h = html_content.find("::test_b")
++    idx_c_h = html_content.find("::test_c")
++    assert idx_a_h != -1 and idx_b_h != -1 and idx_c_h != -1
++    assert idx_a_h < idx_b_h < idx_c_h
++
++
++def test_explain_deselections_sort_by_delta_orders_json_csv_markdown(pytester):
++    pytester.makepyfile(
++        test_sbd="""
++        def test_keep(): pass
++        def test_x1(): pass
++        def test_x2(): pass
++        def test_x3(): pass
++        """
++    )
++    baseline = {
++        "schema_version": 1,
++        "total_deselected": 2,
++        "reasons": [
++            {"reason": "--deselect test_sbd.py::test_x1", "count": 1, "nodeids": []},
++            {"reason": "-k keep", "count": 1, "nodeids": []},
++        ],
++    }
++    baseline_file = pytester.path / "baseline.json"
++    baseline_file.write_text(json.dumps(baseline), encoding="utf-8")
++    json_out = pytester.path / "out.json"
++    csv_out = pytester.path / "out.csv"
++    md_out = pytester.path / "out.md"
++    result = pytester.runpytest(
++        "-q",
++        "--deselect",
++        "test_sbd.py::test_x1",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-baseline",
++        str(baseline_file),
++        "--explain-deselections-sort-by",
++        "delta",
++        "--explain-deselections-output",
++        str(json_out),
++        "--explain-deselections-output",
++        str(csv_out),
++        "--explain-deselections-output",
++        str(md_out),
++    )
++    assert result.ret == 0
++
++    data = json.loads(json_out.read_text(encoding="utf-8"))
++    reasons = [r["reason"] for r in data["reasons"]]
++    assert reasons == ["-k keep", "--deselect test_sbd.py::test_x1"]
++
++    csv_lines = [l for l in csv_out.read_text(encoding="utf-8").splitlines() if l]
++    assert csv_lines == [
++        "reason,count",
++        "-k keep,2",
++        "--deselect test_sbd.py::test_x1,1",
++    ]
++
++    md_content = md_out.read_text(encoding="utf-8")
++    idx_keep = md_content.find("-k keep")
++    idx_deselect = md_content.find("--deselect")
++    assert idx_keep != -1 and idx_deselect != -1
++    assert idx_keep < idx_deselect
++
++
++def test_explain_deselections_show_total_unaffected_by_min_count(pytester):
++    pytester.makepyfile(
++        test_stmc="""
++        def test_keep(): pass
++        def test_a(): pass
++        def test_b(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-show-total",
++        "--explain-deselections-min-count",
++        "10",
++    )
++    assert result.ret == 0
++    out = result.stdout.str()
++    assert "Total deselected: 2" in out
++    assert "deselected by -k keep" not in out
++
++
++def test_explain_deselections_reason_filter_applied_to_json(pytester):
++    pytester.makepyfile(
++        test_rfj="""
++        def test_keep(): pass
++        def test_a(): pass
++        def test_b(): pass
++        """
++    )
++    out_file = pytester.path / "rf.json"
++    result = pytester.runpytest(
++        "-q",
++        "--deselect",
++        "test_rfj.py::test_a",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-reason-filter",
++        r"deselect",
++        "--explain-deselections-format",
++        "json",
++        "--explain-deselections-output",
++        str(out_file),
++    )
++    assert result.ret == 0
++    data = json.loads(out_file.read_text(encoding="utf-8"))
++    reasons = [r["reason"] for r in data["reasons"]]
++    assert any("deselect" in r for r in reasons)
++    assert not any(r == "-k keep" for r in reasons)
++
++
++def test_explain_deselections_fail_if_exceeds_uses_real_total(pytester):
++    pytester.makepyfile(
++        test_fieu="""
++        def test_keep(): pass
++        def test_a(): pass
++        def test_b(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-fail-if-exceeds",
++        "1",
++        "--explain-deselections-min-count",
++        "10",
++    )
++    assert result.ret != 0
++    assert "DESELECTION THRESHOLD EXCEEDED" in result.stdout.str()
++
++
++def test_explain_deselections_update_baseline_removes_stale_reasons(pytester):
++    pytester.makepyfile(
++        test_ubrs="""
++        def test_keep(): pass
++        def test_a(): pass
++        """
++    )
++    old_baseline = {
++        "schema_version": 1,
++        "total_deselected": 5,
++        "reasons": [
++            {"reason": "-k keep", "count": 1, "nodeids": []},
++            {"reason": "-k stale", "count": 4, "nodeids": []},
++        ],
++    }
++    baseline_file = pytester.path / "baseline.json"
++    baseline_file.write_text(json.dumps(old_baseline), encoding="utf-8")
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-baseline",
++        str(baseline_file),
++        "--explain-deselections-update-baseline",
++    )
++    assert result.ret == 0
++    data = json.loads(baseline_file.read_text(encoding="utf-8"))
++    reasons = [r["reason"] for r in data["reasons"]]
++    assert "-k keep" in reasons
++    assert "-k stale" not in reasons
++
++
++def test_explain_deselections_show_stats_numeric_values(pytester):
++    pytester.makepyfile(
++        test_ssv="""
++        import pytest
++
++        @pytest.mark.slow
++        def test_slow_1(): pass
++        @pytest.mark.slow
++        def test_slow_2(): pass
++        @pytest.mark.slow
++        def test_slow_3(): pass
++        def test_fast_keep(): pass
++        def test_fast_drop(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "-m", "not slow",
++        "--deselect", "test_ssv.py::test_fast_drop",
++        "--explain-deselections",
++        "--explain-deselections-show-stats",
++    )
++    import re
++    out = result.stdout.str()
++    assert re.search(r"max per reason:\s*3", out)
++    assert re.search(r"min per reason:\s*1", out)
++    assert re.search(r"mean per reason:\s*2\.0", out)
++    assert re.search(r"median per reason:\s*2\.0", out)
++
++
++def test_explain_deselections_baseline_json_numeric_delta_values(pytester):
++    pytester.makepyfile(
++        test_bnv="""
++        def test_keep(): pass
++        def test_drop_1(): pass
++        def test_drop_2(): pass
++        """
++    )
++    baseline = {
++        "schema_version": 1,
++        "total_deselected": 1,
++        "reasons": [{"reason": "-k keep", "count": 1, "nodeids": []}],
++    }
++    baseline_file = pytester.path / "baseline.json"
++    baseline_file.write_text(json.dumps(baseline), encoding="utf-8")
++    out = pytester.path / "report.json"
++    result = pytester.runpytest(
++        "-q", "-k", "keep",
++        "--explain-deselections",
++        "--explain-deselections-baseline", str(baseline_file),
++        "--explain-deselections-output", str(out),
++    )
++    assert result.ret == 0
++    data = json.loads(out.read_text(encoding="utf-8"))
++    r = data["reasons"][0]
++    assert r["count"] == 2
++    assert r["baseline_count"] == 1
++    assert r["delta"] == 1
++
++
++def test_explain_deselections_baseline_negative_delta_in_json_and_csv(pytester):
++    pytester.makepyfile(
++        test_bnd="""
++        def test_keep(): pass
++        def test_a(): pass
++        """
++    )
++    baseline = {
++        "schema_version": 1,
++        "total_deselected": 3,
++        "reasons": [{"reason": "-k keep", "count": 3, "nodeids": []}],
++    }
++    baseline_file = pytester.path / "baseline.json"
++    baseline_file.write_text(json.dumps(baseline), encoding="utf-8")
++    json_out = pytester.path / "report.json"
++    csv_out = pytester.path / "report.csv"
++    result = pytester.runpytest(
++        "-q",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-baseline",
++        str(baseline_file),
++        "--explain-deselections-output",
++        str(json_out),
++        "--explain-deselections-output",
++        str(csv_out),
++        "--explain-deselections-csv-with-delta",
++    )
++    assert result.ret == 0
++
++    data = json.loads(json_out.read_text(encoding="utf-8"))
++    r = data["reasons"][0]
++    assert r["count"] == 1
++    assert r["baseline_count"] == 3
++    assert isinstance(r["delta"], int)
++    assert r["delta"] == -2
++
++    lines = [l for l in csv_out.read_text(encoding="utf-8").splitlines() if l]
++    assert lines[0] == "reason,count,baseline_count,delta"
++    assert lines[1] == "-k keep,1,3,-2"
++
++
++def test_explain_deselections_baseline_unchanged_and_improved_rendering(pytester):
++    pytester.makepyfile(
++        test_ui="""
++        def test_keep(): pass
++        def test_a(): pass
++        def test_b(): pass
++        """
++    )
++    baseline = {
++        "schema_version": 1,
++        "total_deselected": 4,
++        "reasons": [
++            {"reason": "--deselect test_ui.py::test_a", "count": 1, "nodeids": []},
++            {"reason": "--deselect test_ui.py::test_b", "count": 3, "nodeids": []},
++        ],
++    }
++    baseline_file = pytester.path / "baseline.json"
++    baseline_file.write_text(json.dumps(baseline), encoding="utf-8")
++    md_file = pytester.path / "report.md"
++    html_file = pytester.path / "report.html"
++    result = pytester.runpytest(
++        "-q",
++        "--deselect", "test_ui.py::test_a",
++        "--deselect", "test_ui.py::test_b",
++        "--explain-deselections",
++        "--explain-deselections-baseline", str(baseline_file),
++        "--explain-deselections-output", str(md_file),
++        "--explain-deselections-output", str(html_file),
++    )
++    assert result.ret == 0
++    terminal = result.stdout.str()
++    assert "(+0)" in terminal
++    assert "(-2)" in terminal
++    md = md_file.read_text(encoding="utf-8")
++    assert "+0" in md
++    assert "-2" in md
++    html_content = html_file.read_text(encoding="utf-8")
++    assert "+0" in html_content
++    assert "-2" in html_content
++
++
++def test_explain_deselections_sort_by_delta_without_baseline_equals_count_sort(pytester):
++    pytester.makepyfile(
++        test_dltnobase="""
++        def test_x1(): pass
++        def test_x2(): pass
++        def test_x3(): pass
++        def test_keep(): pass
++        """
++    )
++    result_count = pytester.runpytest(
++        "-q",
++        "-k", "keep",
++        "--deselect", "test_dltnobase.py::test_x1",
++        "--explain-deselections",
++        "--explain-deselections-sort-by", "count",
++    )
++    result_delta = pytester.runpytest(
++        "-q",
++        "-k", "keep",
++        "--deselect", "test_dltnobase.py::test_x1",
++        "--explain-deselections",
++        "--explain-deselections-sort-by", "delta",
++    )
++    count_out = result_count.stdout.str()
++    delta_out = result_delta.stdout.str()
++    k_idx_count = count_out.find("-k keep")
++    k_idx_delta = delta_out.find("-k keep")
++    deselect_idx_count = count_out.find("--deselect")
++    deselect_idx_delta = delta_out.find("--deselect")
++    assert k_idx_count != -1 and deselect_idx_count != -1
++    assert k_idx_delta != -1 and deselect_idx_delta != -1
++    assert (k_idx_count < deselect_idx_count) == (k_idx_delta < deselect_idx_delta)
++
++
++def test_explain_deselections_output_path_format_override_nonstandard_ext(pytester):
++    pytester.makepyfile(
++        test_datjson="""
++        def test_keep(): pass
++        def test_other(): pass
++        """
++    )
++    out = pytester.path / "report.dat"
++    result = pytester.runpytest(
++        "-q", "-k", "keep",
++        "--explain-deselections",
++        "--explain-deselections-output", str(out) + ":json",
++    )
++    assert result.ret == 0
++    data = json.loads(out.read_text(encoding="utf-8"))
++    assert "total_deselected" in data
++
++
++def test_explain_deselections_invalid_format_token_not_treated_as_selector(pytester):
++    pytester.makepyfile(
++        test_badtok="""
++        def test_keep(): pass
++        def test_other(): pass
++        """
++    )
++    clean = pytester.path / "report.json"
++    result = pytester.runpytest(
++        "-q", "-k", "keep",
++        "--explain-deselections",
++        "--explain-deselections-output", str(clean) + ":bogus",
++    )
++    assert "deselected by -k keep: 1" in result.stdout.str()
++    content = clean.read_text(encoding="utf-8") if clean.exists() else ""
++    assert content.strip() == "" or "total_deselected" not in content
++
++
++def test_explain_deselections_unknown_token_kept_as_literal_filename(pytester):
++    pytester.makepyfile(
++        test_badtok2="""
++        def test_keep(): pass
++        def test_other(): pass
++        """
++    )
++    clean = pytester.path / "report.json"
++    literal_path = pytester.path / "sub" / "report.json:bogus"
++    result = pytester.runpytest(
++        "-q", "-k", "keep",
++        "--explain-deselections",
++        "--explain-deselections-output", str(literal_path),
++    )
++    assert result.ret == 0
++    assert not clean.exists()
++    assert literal_path.is_file()
++    content = literal_path.read_text(encoding="utf-8")
++    assert "deselected by -k keep: 1" in content
++
++
++def test_explain_deselections_stats_median_even_bucket_count(pytester):
++    pytester.makepyfile(
++        test_smev="""
++        def test_keep(): pass
++        class TestA:
++            def test_1(self): pass
++        class TestB:
++            def test_1(self): pass
++        class TestC:
++            def test_1(self): pass
++            def test_2(self): pass
++        class TestD:
++            def test_1(self): pass
++            def test_2(self): pass
++            def test_3(self): pass
++            def test_4(self): pass
++            def test_5(self): pass
++            def test_6(self): pass
++            def test_7(self): pass
++            def test_8(self): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "--deselect", "test_smev.py::TestA",
++        "--deselect", "test_smev.py::TestB",
++        "--deselect", "test_smev.py::TestC",
++        "--deselect", "test_smev.py::TestD",
++        "--explain-deselections",
++        "--explain-deselections-show-stats",
++    )
++    out = result.stdout.str()
++    assert re.search(r"distinct reasons:\s*4", out)
++    assert re.search(r"mean per reason:\s*3\.0", out)
++    assert re.search(r"median per reason:\s*1\.5", out)
++
++
++def test_explain_deselections_min_count_filters_csv_md_html(pytester):
++    pytester.makepyfile(
++        test_mcfmt="""
++        import pytest
++
++        @pytest.mark.fast
++        def test_fast(): pass
++
++        def test_slow_1(): pass
++        def test_slow_2(): pass
++        def test_slow_3(): pass
++        """
++    )
++    csv_out = pytester.path / "out.csv"
++    md_out = pytester.path / "out.md"
++    html_out = pytester.path / "out.html"
++    result = pytester.runpytest(
++        "-q",
++        "-m",
++        "fast",
++        "--explain-deselections",
++        "--explain-deselections-min-count",
++        "5",
++        "--explain-deselections-output",
++        str(csv_out),
++        "--explain-deselections-output",
++        str(md_out),
++        "--explain-deselections-output",
++        str(html_out),
++    )
++    assert result.ret == 0
++    csv_lines = [l for l in csv_out.read_text(encoding="utf-8").splitlines() if l]
++    assert csv_lines == ["reason,count"]
++    md_content = md_out.read_text(encoding="utf-8")
++    assert "-m fast" not in md_content
++    assert "No deselections recorded." in md_content
++    html_content = html_out.read_text(encoding="utf-8")
++    assert "-m fast" not in html_content
++    assert "No deselections recorded." in html_content
++
++
++def test_explain_deselections_sort_by_count_orders_json_csv_markdown(pytester):
++    pytester.makepyfile(
++        test_sbfmt="""
++        def test_keep(): pass
++        def test_x1(): pass
++        def test_x2(): pass
++        def test_x3(): pass
++        """
++    )
++    json_out = pytester.path / "out.json"
++    csv_out = pytester.path / "out.csv"
++    md_out = pytester.path / "out.md"
++    result = pytester.runpytest(
++        "-q",
++        "--deselect",
++        "test_sbfmt.py::test_x1",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-sort-by",
++        "count",
++        "--explain-deselections-output",
++        str(json_out),
++        "--explain-deselections-output",
++        str(csv_out),
++        "--explain-deselections-output",
++        str(md_out),
++    )
++    assert result.ret == 0
++
++    data = json.loads(json_out.read_text(encoding="utf-8"))
++    reasons = [r["reason"] for r in data["reasons"]]
++    assert reasons == ["-k keep", "--deselect test_sbfmt.py::test_x1"]
++
++    csv_lines = [l for l in csv_out.read_text(encoding="utf-8").splitlines() if l]
++    assert csv_lines == [
++        "reason,count",
++        "-k keep,2",
++        "--deselect test_sbfmt.py::test_x1,1",
++    ]
++
++    md_content = md_out.read_text(encoding="utf-8")
++    idx_keep = md_content.find("-k keep")
++    idx_deselect = md_content.find("--deselect")
++    assert idx_keep != -1 and idx_deselect != -1
++    assert idx_keep < idx_deselect
++
++
++def test_explain_deselections_junit_system_out_empty_when_nothing_deselected(pytester):
++    pytester.makepyfile(
++        test_jseo="""
++        def test_a(): pass
++        """
++    )
++    xmlpath = pytester.path / "jseo.xml"
++    result = pytester.runpytest(
++        "--junitxml",
++        str(xmlpath),
++        "--explain-deselections",
++        "--explain-deselections-junit",
++        "system-out",
++        "-q",
++    )
++    assert result.ret == 0
++    root = ET.fromstring(xmlpath.read_text(encoding="utf-8"))
++    suite = root.find("testsuite")
++    if suite is None:
++        suite = root.find("./testsuite")
++    if suite is None:
++        suite = root.find("./testsuites/testsuite")
++    assert suite is not None
++    node = suite.find("system-out")
++    assert node is None or not (node.text or "").strip()
++    assert "deselected by" not in result.stdout.str()
++
++
++def test_explain_deselections_junit_system_out_empty_when_filter_hides_all(pytester):
++    pytester.makepyfile(
++        test_jsfh="""
++        def test_keep(): pass
++        def test_drop(): pass
++        """
++    )
++    xmlpath = pytester.path / "jsfh.xml"
++    result = pytester.runpytest(
++        "--junitxml",
++        str(xmlpath),
++        "--explain-deselections",
++        "--explain-deselections-junit",
++        "system-out",
++        "--explain-deselections-reason-filter",
++        r"^NOMATCH$",
++        "-q",
++        "-k",
++        "keep",
++    )
++    assert result.ret == 0
++    root = ET.fromstring(xmlpath.read_text(encoding="utf-8"))
++    suite = root.find("testsuite")
++    if suite is None:
++        suite = root.find("./testsuite")
++    if suite is None:
++        suite = root.find("./testsuites/testsuite")
++    assert suite is not None
++    node = suite.find("system-out")
++    assert node is None or not (node.text or "").strip()
++    assert "deselected by" not in result.stdout.str()
++
++
++def test_explain_deselections_reason_filter_applied_to_markdown_and_html(pytester):
++    pytester.makepyfile(
++        test_rfmh="""
++        def test_keep(): pass
++        def test_a(): pass
++        def test_b(): pass
++        """
++    )
++    md_file = pytester.path / "rfmh.md"
++    html_file = pytester.path / "rfmh.html"
++    result = pytester.runpytest(
++        "-q",
++        "--deselect",
++        "test_rfmh.py::test_a",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-reason-filter",
++        r"deselect",
++        "--explain-deselections-output",
++        str(md_file),
++        "--explain-deselections-output",
++        str(html_file),
++    )
++    assert result.ret == 0
++    md_content = md_file.read_text(encoding="utf-8")
++    html_content = html_file.read_text(encoding="utf-8")
++    assert "--deselect" in md_content
++    assert "-k keep" not in md_content
++    assert "--deselect" in html_content
++    assert "-k keep" not in html_content
++
++
++def test_explain_deselections_reasons_cap_applied_to_markdown_and_html(pytester):
++    pytester.makepyfile(
++        test_rcmh="""
++        def test_a(): pass
++        def test_b(): pass
++        def test_c(): pass
++        """
++    )
++    md_file = pytester.path / "rcmh.md"
++    html_file = pytester.path / "rcmh.html"
++    result = pytester.runpytest(
++        "-q",
++        "--deselect",
++        "test_rcmh.py::test_a",
++        "--deselect",
++        "test_rcmh.py::test_b",
++        "--deselect",
++        "test_rcmh.py::test_c",
++        "--explain-deselections",
++        "--explain-deselections-reasons-cap",
++        "1",
++        "--explain-deselections-output",
++        str(md_file),
++        "--explain-deselections-output",
++        str(html_file),
++    )
++    assert result.ret == ExitCode.NO_TESTS_COLLECTED
++    md_content = md_file.read_text(encoding="utf-8")
++    html_content = html_file.read_text(encoding="utf-8")
++    assert md_content.count("--deselect") == 1
++    assert html_content.count("--deselect") == 1
++
++
++def test_explain_deselections_show_stats_distinct_reasons_exact_value(pytester):
++    pytester.makepyfile(
++        test_ssdr="""
++        import pytest
++
++        @pytest.mark.slow
++        def test_slow(): pass
++
++        def test_keep(): pass
++
++        def test_drop_1(): pass
++
++        def test_drop_2(): pass
++        """
++    )
++    result = pytester.runpytest(
++        "-q",
++        "-m",
++        "not slow",
++        "-k",
++        "keep or drop_1 or drop_2",
++        "--deselect",
++        "test_ssdr.py::test_drop_1",
++        "--explain-deselections",
++        "--explain-deselections-show-stats",
++    )
++    out = result.stdout.str()
++    assert re.search(r"distinct reasons:\s*2", out)
++
++
++def test_explain_deselections_cross_format_consistent_reason_set(pytester):
++    pytester.makepyfile(
++        test_xfmt="""
++        def test_a(): pass
++        def test_b(): pass
++        def test_c(): pass
++        def test_keep(): pass
++        """
++    )
++    json_file = pytester.path / "out.json"
++    csv_file = pytester.path / "out.csv"
++    md_file = pytester.path / "out.md"
++    html_file = pytester.path / "out.html"
++    result = pytester.runpytest(
++        "-q",
++        "--deselect",
++        "test_xfmt.py::test_a",
++        "--deselect",
++        "test_xfmt.py::test_b",
++        "--deselect",
++        "test_xfmt.py::test_c",
++        "-k",
++        "keep",
++        "--explain-deselections",
++        "--explain-deselections-reason-filter",
++        r"deselect",
++        "--explain-deselections-sort-by",
++        "reason",
++        "--explain-deselections-reasons-cap",
++        "2",
++        "--explain-deselections-output",
++        str(json_file),
++        "--explain-deselections-output",
++        str(csv_file),
++        "--explain-deselections-output",
++        str(md_file),
++        "--explain-deselections-output",
++        str(html_file),
++    )
++    assert result.ret == 0
++
++    terminal_out = result.stdout.str()
++    terminal_reasons = set(
++        re.findall(
++            r"deselected by (.+?): \d+(?: \(.*?\))?(?:\n|$)", terminal_out
++        )
++    )
++
++    data = json.loads(json_file.read_text(encoding="utf-8"))
++    json_reasons = {r["reason"] for r in data["reasons"]}
++
++    import csv as _csv
++    with csv_file.open(newline="", encoding="utf-8") as f:
++        csv_rows = list(_csv.reader(f))
++    csv_reasons = {row[0] for row in csv_rows[1:] if row}
++
++    md_content = md_file.read_text(encoding="utf-8")
++    html_content = html_file.read_text(encoding="utf-8")
++
++    assert len(terminal_reasons) == 2
++    assert json_reasons == terminal_reasons
++    assert csv_reasons == terminal_reasons
++    for reason in terminal_reasons:
++        assert reason in md_content
++        assert reason in html_content
